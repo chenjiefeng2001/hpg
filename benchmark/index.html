@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>hpg — Phase 6C Benchmark</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; font-family: 'SF Mono', 'Fira Code', monospace; color: #e0e0e0; padding: 2rem; }
+    h1 { font-size: 1.2rem; color: #4fc3f7; margin-bottom: 1rem; }
+    #results { white-space: pre; font-size: 0.8rem; line-height: 1.5; }
+    canvas { display: none; }
+  </style>
+</head>
+<body>
+  <h1>hpg — Phase 6C: GPU Culling Benchmark</h1>
+  <div id="results">Initializing…</div>
+  <canvas id="canvas" width="800" height="600"></canvas>
+  <script type="module" src="./phase6.ts"></script>
+</body>
+</html>

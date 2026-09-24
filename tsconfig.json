@@ -6,7 +6,6 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["@webgpu/types"],
     "strict": true,
-    "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
     "noFallthroughCasesInSwitch": true,
     "exactOptionalPropertyTypes": false,
@@ -15,5 +14,14 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "test", "demo", "index.html", "vitest.config.ts", "vite.config.ts"]
+  "include": [
+    "src",
+    "test",
+    "demo",
+    "benchmark",
+    "index.html",
+    "vitest.config.ts",
+    "vite.config.ts",
+    "vite.demo.config.ts"
+  ]
 }

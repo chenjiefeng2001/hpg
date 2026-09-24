@@ -5,18 +5,49 @@
   "type": "module",
   "license": "MIT",
   "sideEffects": false,
-  "exports": {
-    ".": "./src/index.ts"
+  "publishConfig": {
+    "access": "public"
   },
+  "files": [
+    "dist/lib",
+    "LICENSE",
+    "CHANGELOG.md",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/lib/index.d.ts",
+      "import": "./dist/lib/index.js"
+    }
+  },
+  "types": "./dist/lib/index.d.ts",
   "scripts": {
     "dev": "vite",
+    "bench": "vite --open /benchmark/",
+    "audit": "vite-node benchmark/asset-compat-cli.ts",
+    "verify:browser": "node benchmark/browser-material-check.mjs",
     "build": "vite build && tsc -p tsconfig.build.json",
+    "build:demo": "vite build --config vite.demo.config.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "clean": "node -e \"import('node:fs').then(fs=>fs.rmSync('dist',{recursive:true,force:true}))\""
+    "clean": "node -e \"import('node:fs').then(fs=>fs.rmSync('dist',{recursive:true,force:true}))\"",
+    "verify:package": "node scripts/verify-package.mjs",
+    "prepack": "npm run build"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@webgpu/types": ">=0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@webgpu/types": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@types/node": "^26.6.2",
     "@webgpu/types": "^0.1.54",
     "typescript": "~5.6.3",
     "vite": "^5.4.11",

@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>hpg — Real-Workload Benchmark</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0d1117; color: #c9d1d9; font-family: 'SF Mono', monospace; padding: 24px; }
+    h1 { font-size: 18px; color: #58a6ff; margin-bottom: 4px; }
+    .subtitle { font-size: 12px; color: #8b949e; margin-bottom: 24px; }
+    .section { margin-bottom: 24px; }
+    .section h2 { font-size: 14px; color: #7ee787; border-bottom: 1px solid #21262d; padding-bottom: 6px; margin-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th { text-align: left; color: #8b949e; padding: 6px 8px; border-bottom: 1px solid #21262d; }
+    td { padding: 6px 8px; border-bottom: 1px solid #161b22; }
+    tr:hover { background: #161b22; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .highlight { color: #58a6ff; font-weight: bold; }
+    .warn { color: #d29922; }
+    .good { color: #7ee787; }
+    #status { color: #8b949e; font-size: 12px; margin-bottom: 16px; }
+    button {
+      background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+      padding: 8px 16px; border-radius: 6px; cursor: pointer; font-family: inherit;
+      margin-right: 8px; font-size: 12px;
+    }
+    button:hover { background: #30363d; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .bar-container { width: 100%; height: 16px; background: #161b22; border-radius: 4px; overflow: hidden; }
+    .bar { height: 100%; border-radius: 4px; transition: width 0.3s; }
+    .bar-cpu { background: #58a6ff; }
+    .bar-gpu { background: #f78166; }
+    .bar-upload { background: #d2a8ff; }
+    .bar-parse { background: #7ee787; }
+  </style>
+</head>
+<body>
+  <h1>hpg — Real-Workload Benchmark</h1>
+  <p class="subtitle">Synthetic GLB models with Blender-like characteristics: hierarchy, varying mesh sizes, multiple materials</p>
+
+  <div class="section">
+    <button id="btn-run" onclick="runBenchmark()">Run Benchmark</button>
+    <span id="status">Ready.</span>
+  </div>
+
+  <div id="results"></div>
+
+  <script type="module" src="./bench-glb.ts"></script>
+</body>
+</html>

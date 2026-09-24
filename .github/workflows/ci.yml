@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - 18.x
+          - 20.x
+          - 22.x
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit and integration tests
+        run: npm test
+
+  package:
+    name: Build and inspect package
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify asset corpus
+        shell: bash
+        run: |
+          count="$(find benchmark/assets/models -type f -name '*.glb' | wc -l | tr -d ' ')"
+          if [ "$count" -eq 0 ]; then
+            echo "No GLB assets found under benchmark/assets/models" >&2
+            exit 1
+          fi
+          echo "GLB corpus: $count files"
+      - name: Real-asset audit
+        run: npm run audit
+      - name: Library build
+        run: npm run build
+      - name: Demo build
+        run: npm run build:demo
+      - name: Pack dry run
+        run: npm pack --dry-run
+      - name: Inspect package boundary
+        shell: bash
+        run: |
+          npm pack --pack-destination "$RUNNER_TEMP" --ignore-scripts
+          tarball="$(find "$RUNNER_TEMP" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          if [ -z "$tarball" ]; then
+            echo "npm pack did not produce a tarball" >&2
+            exit 1
+          fi
+          tar -tzf "$tarball" > package-files.txt
+          grep -F 'package/dist/lib/index.js' package-files.txt
+          grep -F 'package/dist/lib/index.d.ts' package-files.txt
+          if grep -Eq '^package/(src|test|demo|benchmark)(/|$)' package-files.txt; then
+            echo "Forbidden source or test content found in package" >&2
+            cat package-files.txt >&2
+            exit 1
+          fi
+          cat package-files.txt
+      - name: Verify external consumer
+        shell: bash
+        run: |
+          tarball="$(find "$RUNNER_TEMP" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          npm run verify:package -- "$tarball"
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-package-${{ github.sha }}
+          path: ${{ runner.temp }}/*.tgz
+          if-no-files-found: error
