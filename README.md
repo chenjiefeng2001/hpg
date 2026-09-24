@@ -7,7 +7,15 @@
 It takes a flat list of render work and turns it into efficient GPU commands. The package includes
 a narrow glTF and material helper path for producing render work, not a complete asset engine.
 
+After the npm publication workflow has run, install the default technical-baseline channel with:
+
+```bash
+npm install @hpg/runtime@next
 ```
+
+If a release is explicitly published with the `latest` distribution tag, use:
+
+```bash
 npm install @hpg/runtime
 ```
 
@@ -420,13 +428,15 @@ npm run audit heavy      # filter by path substring
 
 ## CI and GitHub Release
 
-The repository uses two GitHub Actions workflows. Both require the source, tests, benchmark assets,
-and `package-lock.json` to be committed; a local untracked file is not available to a clean runner.
+The repository uses three GitHub Actions workflows. All of them require the source, tests, benchmark
+assets, and `package-lock.json` to be committed; a local untracked file is not available to a clean
+runner.
 
 | Workflow | Trigger | Automated checks |
 |----------|---------|------------------|
 | `.github/workflows/ci.yml` | Push to `main`, pull request, or manual dispatch | Node 18/20/22 typecheck and tests; Node 22 asset audit, library/demo builds, package-boundary inspection, external consumer verification, and tarball artifact upload |
 | `.github/workflows/release.yml` | Push a `vX.Y.Z` tag | Version consistency, typecheck, tests, asset audit, builds, package-boundary inspection, external consumer verification, and GitHub Release creation with the final `.tgz` |
+| `.github/workflows/publish-npm.yml` | Manual dispatch for an existing release tag | Re-runs the release gates, verifies the package consumer, and publishes `@hpg/runtime` to npm with provenance |
 
 The browser WebGPU gate is intentionally separate. Run it locally when the release scope includes
 real Chrome rendering:
@@ -436,8 +446,22 @@ npm run verify:browser
 ```
 
 The release workflow creates a GitHub Release and attaches the npm tarball. It does not run
-`npm publish`; npm registry publication, provenance, and registry credentials remain a separate
-release decision.
+`npm publish`; publication is a separate protected operation through `publish-npm.yml`.
+
+### npm publication
+
+1. Create an npm automation token with publish permission for `@hpg/runtime`.
+2. Add it to the repository as the `NPM_TOKEN` GitHub Actions secret.
+3. Push the version tag and wait for the GitHub Release checks to pass.
+4. Run the `Publish npm package` workflow with that tag and choose `next` or `latest`.
+
+The workflow validates the tag, reruns the package gates, runs the external consumer check, and
+publishes with npm provenance. The default `next` channel reflects that `0.2.0` is a technical
+baseline rather than a production-ready release. Use `latest` only when that channel should expose
+the version to unqualified `npm install @hpg/runtime` commands.
+
+Until publication, other projects can consume the `.tgz` attached to the corresponding GitHub
+Release.
 
 Before creating a tag:
 
@@ -470,6 +494,7 @@ The tag name must match the version in both `package.json` and `package-lock.jso
 | `npm run build:demo` | Build all five demo and benchmark pages |
 | `npm run verify:package` | Pack, install in a fresh directory, import, and typecheck the consumer boundary |
 | `npm pack --dry-run` | Preview the package file list and lifecycle build |
+| `npm publish --dry-run --access public` | Validate the publish lifecycle without publishing |
 | `npm run clean` | Remove generated `dist` output |
 
 Coverage is configured in `vitest.config.ts`, but `@vitest/coverage-v8` and a coverage script are

@@ -1,0 +1,100 @@
+name: Publish npm package
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing Git tag to publish
+        required: true
+        default: v0.2.0
+        type: string
+      dist_tag:
+        description: npm distribution tag
+        required: true
+        default: next
+        type: choice
+        options:
+          - next
+          - latest
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-npm-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish package
+    runs-on: ubuntu-latest
+    environment: npm
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      DIST_TAG: ${{ inputs.dist_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          registry-url: https://registry.npmjs.org
+          scope: '@hpg'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify release tag
+        shell: bash
+        run: |
+          if [[ "$RELEASE_TAG" != v* ]]; then
+            echo "Release tag must start with v" >&2
+            exit 1
+          fi
+          package_version="$(node -p "require('./package.json').version")"
+          lock_version="$(node -p "require('./package-lock.json').version")"
+          lock_root_version="$(node -p "require('./package-lock.json').packages[''].version")"
+          tag_version="${RELEASE_TAG#v}"
+          if [ "$tag_version" != "$package_version" ]; then
+            echo "Tag $RELEASE_TAG does not match package version $package_version" >&2
+            exit 1
+          fi
+          if [ "$lock_version" != "$package_version" ] || [ "$lock_root_version" != "$package_version" ]; then
+            echo "package-lock.json version does not match package.json" >&2
+            exit 1
+          fi
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit and integration tests
+        run: npm test
+      - name: Verify asset corpus
+        shell: bash
+        run: |
+          count="$(find benchmark/assets/models -type f -name '*.glb' | wc -l | tr -d ' ')"
+          if [ "$count" -eq 0 ]; then
+            echo "No GLB assets found under benchmark/assets/models" >&2
+            exit 1
+          fi
+          echo "GLB corpus: $count files"
+      - name: Real-asset audit
+        run: npm run audit
+      - name: Library build
+        run: npm run build
+      - name: Demo build
+        run: npm run build:demo
+      - name: Verify package consumer
+        run: npm run verify:package
+      - name: Publish to npm
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN is not configured in repository secrets" >&2
+            exit 1
+          fi
+          npm publish --provenance --access public --tag "$DIST_TAG"

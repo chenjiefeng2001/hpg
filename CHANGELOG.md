@@ -58,17 +58,19 @@ tsc bundler + @webgpu/types   0 error
 
 ### CI and release plumbing
 
-The repository now has two GitHub Actions workflows:
+The repository now has three GitHub Actions workflows:
 
 - `.github/workflows/ci.yml` runs the reproducible Node, asset, build, package-boundary, and
   external-consumer checks for pull requests and pushes to `main`.
 - `.github/workflows/release.yml` runs the release checks when a `vX.Y.Z` tag is pushed, then creates
   a GitHub Release with the final npm tarball attached.
+- `.github/workflows/publish-npm.yml` provides a protected manual npm publication path with an
+  `NPM_TOKEN` secret, provenance, and an explicit `next` or `latest` distribution tag.
 - `prepack` builds the library before `npm pack` and `npm publish` create a package archive.
 - The real Chrome/WebGPU gate remains a local command (`npm run verify:browser`) because WebGPU
   availability on hosted runners is environment-dependent.
-- The GitHub Release workflow does not publish to the npm registry. Registry credentials and
-  publication policy are intentionally outside this release workflow.
+- The GitHub Release workflow does not publish to the npm registry; npm publication is deliberately
+  a separate manual operation.
 
 The six frozen verification gates remain part of the baseline record, but they are not all executed
 by the hosted CI runner. The browser gate must be run separately on a WebGPU-capable machine.

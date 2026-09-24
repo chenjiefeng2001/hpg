@@ -69,8 +69,8 @@ jobs:
         run: npm run build
       - name: Demo build
         run: npm run build:demo
-      - name: Pack dry run
-        run: npm pack --dry-run
+      - name: Publish dry run
+        run: npm publish --dry-run --access public --tag next
       - name: Inspect package boundary
         shell: bash
         run: |
