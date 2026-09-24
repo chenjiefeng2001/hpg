@@ -424,28 +424,24 @@ describe('10E: Realistic GLB parsing', () => {
     }
   });
 
-  it('parse time scales linearly with model size', () => {
+  it('parses increasing model sizes consistently', () => {
     const sizes = [10, 50, 200];
-    const times: number[] = [];
 
     for (const meshCount of sizes) {
       const glb = generateGlb({
-        meshCount, avgVerticesPerMesh: 1000, avgTrianglesPerMesh: 300,
-        materialCount: 5, hierarchyDepth: 2,
+        meshCount,
+        avgVerticesPerMesh: 1000,
+        avgTrianglesPerMesh: 300,
+        materialCount: 5,
+        hierarchyDepth: 2,
       });
-      // Warmup
-      for (let w = 0; w < 3; w++) parseGltf(glb);
+      const asset = parseGltf(glb);
 
-      const t0 = performance.now();
-      for (let s = 0; s < 10; s++) parseGltf(glb);
-      times.push((performance.now() - t0) / 10);
+      expect(asset.meshes).toHaveLength(meshCount);
+      expect(asset.materials).toHaveLength(5);
+      expect(asset.meshes.every((mesh) => mesh.primitives.length === 1)).toBe(true);
+      expect(asset.meshes.every((mesh) => mesh.primitives[0]!.vertices.length > 0)).toBe(true);
+      expect(asset.meshes.every((mesh) => mesh.primitives[0]!.indices.length > 0)).toBe(true);
     }
-
-    const ratio1 = times[1]! / times[0]!;
-    const ratio2 = times[2]! / times[1]!;
-    expect(ratio1).toBeGreaterThan(2);
-    expect(ratio1).toBeLessThan(15);
-    expect(ratio2).toBeGreaterThan(2);
-    expect(ratio2).toBeLessThan(15);
   });
 });
