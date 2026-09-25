@@ -37,6 +37,8 @@ const KNOWN_WARNING_PATTERNS = [
   /^morph target（变形目标）未实现/,
   /^COLOR_0（顶点色）被忽略/,
   /^TEXCOORD_\d 被忽略/,
+  /^贴图 texCoord=\d+ 被忽略/,
+  /^doubleSided=true 未实现/,
   /^顶点属性 [A-Z0-9_]+ 未实现/,
   /^模型声明了必需扩展/,
   /^glTF 扩展 [A-Za-z0-9_]+ 未实现/,
@@ -47,6 +49,7 @@ const KNOWN_WARNING_PATTERNS = [
 const AUDIT_FEATURE_TO_WARNING: Record<string, string> = {
   // baseColorTexture / MASK 已在材质路径实现 → 不再要求对应 warning。
   'material.alphaMode=BLEND': 'alphaMode=BLEND 未实现',
+  doubleSided: 'doubleSided=true 未实现',
   'material.normalTexture': 'normal / occlusion / emissive 贴图未采样',
   JOINTS_0: 'JOINTS_0/WEIGHTS_0 未实现',
   WEIGHTS_0: 'JOINTS_0/WEIGHTS_0 未实现',
@@ -110,6 +113,11 @@ describe('Phase 11C — 未实现 feature 的结构化提示', () => {
 
     const multiUv = load('feature/MultiUVTest.glb').warnings;
     expect(multiUv).toContain('TEXCOORD_1 被忽略：只使用 TEXCOORD_0。');
+  });
+
+  it('非零 texture texCoord 给出一次结构化提示', () => {
+    const warnings = load('feature/MultiUVTest.glb').warnings.filter((warning) => warning.startsWith('贴图 texCoord='));
+    expect(warnings).toEqual(['贴图 texCoord=1 被忽略：只使用 TEXCOORD_0。']);
   });
 
   it('alphaMode 与材质扩展给出可读提示（同一扩展只报一次）', () => {

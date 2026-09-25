@@ -22,14 +22,14 @@ import { identity } from './math';
 export interface ImportOptions {
   /** 全局缩放因子。默认 1。 */
   scale?: number;
-  /** 是否翻转 V 坐标（glTF V=0 在底部，WebGPU V=0 在顶部）。默认 true。 */
+  /** 是否翻转 V 坐标。glTF 与 WebGPU 都以左上角为纹理坐标原点，默认 false。 */
   flipV?: boolean;
 }
 
 export interface ImportedMesh {
   name: string;
   geometry: Geometry;
-  materialIndex: number;
+  materialIndex?: number;
   worldMatrix: Float32Array;
 }
 
@@ -49,6 +49,7 @@ export interface ImportedMaterial {
 export interface MaterialBindingSource {
   has(materialIndex: number): boolean;
   bindGroupFor(materialIndex: number): GPUBindGroup | undefined;
+  defaultBindGroup?(): GPUBindGroup;
 }
 
 export interface ImportedScene {
@@ -59,6 +60,70 @@ export interface ImportedScene {
   flatNodes: FlattenedNode[];
   /** Scene bounding box: [minX, minY, minZ, maxX, maxY, maxZ] */
   bounds: [number, number, number, number, number, number];
+  dispose(): void;
+}
+
+function expandFlatNormals(
+  vertices: Float32Array,
+  layout: { arrayStride: number; attributes: { shaderLocation: number; offset: number; format: GPUVertexFormat }[] },
+  indices: Uint16Array | Uint32Array,
+): { vertices: Float32Array; indices: Uint16Array | Uint32Array } {
+  const stride = layout.arrayStride / 4;
+  const pos = layout.attributes.find((attribute) => attribute.shaderLocation === 0);
+  const uv = layout.attributes.find((attribute) => attribute.shaderLocation === 2);
+  if (!pos || stride <= 0) throw new Error('Flat normal expansion requires a position attribute.');
+  const posOffset = pos.offset / 4;
+  const uvOffset = uv ? uv.offset / 4 : -1;
+  const output = new Float32Array(indices.length * 12);
+  const readPosition = (index: number): [number, number, number] => {
+    const offset = index * stride + posOffset;
+    return [vertices[offset] as number, vertices[offset + 1] as number, vertices[offset + 2] as number];
+  };
+  for (let i = 0; i < indices.length; i += 3) {
+    const a = readPosition(indices[i] as number);
+    const b = readPosition(indices[i + 1] as number);
+    const c = readPosition(indices[i + 2] as number);
+    const ab: [number, number, number] = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const ac: [number, number, number] = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let nx = ab[1] * ac[2] - ab[2] * ac[1];
+    let ny = ab[2] * ac[0] - ab[0] * ac[2];
+    let nz = ab[0] * ac[1] - ab[1] * ac[0];
+    const length = Math.hypot(nx, ny, nz);
+    if (length > 0) {
+      nx /= length;
+      ny /= length;
+      nz /= length;
+    } else {
+      nx = 0;
+      ny = 0;
+      nz = 1;
+    }
+    for (let corner = 0; corner < 3; corner++) {
+      const sourceIndex = indices[i + corner] as number;
+      const sourceOffset = sourceIndex * stride;
+      const destination = (i + corner) * 12;
+      output[destination] = vertices[sourceOffset + posOffset] as number;
+      output[destination + 1] = vertices[sourceOffset + posOffset + 1] as number;
+      output[destination + 2] = vertices[sourceOffset + posOffset + 2] as number;
+      output[destination + 3] = nx;
+      output[destination + 4] = ny;
+      output[destination + 5] = nz;
+      if (uvOffset >= 0) {
+        output[destination + 6] = vertices[sourceOffset + uvOffset] as number;
+        output[destination + 7] = vertices[sourceOffset + uvOffset + 1] as number;
+      }
+      output[destination + 8] = DEFAULT_TANGENT[0];
+      output[destination + 9] = DEFAULT_TANGENT[1];
+      output[destination + 10] = DEFAULT_TANGENT[2];
+      output[destination + 11] = DEFAULT_TANGENT[3];
+    }
+  }
+  const expandedCount = output.length / 12;
+  const expandedIndices = expandedCount <= 65536
+    ? new Uint16Array(expandedCount)
+    : new Uint32Array(expandedCount);
+  for (let i = 0; i < expandedIndices.length; i++) expandedIndices[i] = i;
+  return { vertices: output, indices: expandedIndices };
 }
 
 // ─── Geometry Creation ──────────────────────────────────────
@@ -221,11 +286,21 @@ function createGeometryFromPrimitive(
   vertices: Float32Array,
   vertexLayout: { arrayStride: number; attributes: { shaderLocation: number; offset: number; format: GPUVertexFormat }[] },
   indices: Uint16Array | Uint32Array,
-  indexFormat: GPUIndexFormat,
   flipV: boolean,
 ): Geometry {
-  // Convert to canonical layout (stride 48: pos3 + norm3 + uv2 + tan4)
-  let canonicalVerts = toCanonicalLayout(vertices, vertexLayout);
+  let sourceVertices = vertices;
+  let sourceIndices = indices;
+  let sourceLayout = vertexLayout;
+  if (!vertexLayout.attributes.some((attribute) => attribute.shaderLocation === 1)) {
+    const expanded = expandFlatNormals(vertices, vertexLayout, indices);
+    sourceVertices = expanded.vertices;
+    sourceIndices = expanded.indices;
+    sourceLayout = {
+      arrayStride: CANONICAL_STRIDE,
+      attributes: CANONICAL_LAYOUT.attributes,
+    };
+  }
+  let canonicalVerts = toCanonicalLayout(sourceVertices, sourceLayout);
 
   // Flip V coordinate if needed
   if (flipV) {
@@ -245,7 +320,7 @@ function createGeometryFromPrimitive(
     })),
   }];
 
-  return arena.createGeometry(canonicalVerts, hpgLayouts, indices, indexFormat);
+  return arena.createGeometry(canonicalVerts, hpgLayouts, sourceIndices, sourceIndices instanceof Uint32Array ? 'uint32' : 'uint16');
 }
 
 // ─── Material Conversion ────────────────────────────────────
@@ -281,7 +356,7 @@ export function importGltfAsset(
   renderer: Renderer,
   options: ImportOptions = {},
 ): ImportedScene {
-  const { scale = 1, flipV = true } = options;
+  const { scale = 1, flipV = false } = options;
   const arena = renderer.geometryArena;
 
   // 展平场景树
@@ -322,7 +397,6 @@ export function importGltfAsset(
           prim.vertices,
           prim.vertexLayout,
           prim.indices,
-          prim.indexFormat,
           flipV,
         );
         geometryCache.set(prim, geometry);
@@ -351,7 +425,17 @@ export function importGltfAsset(
     ? [boundsMin[0], boundsMin[1], boundsMin[2], boundsMax[0], boundsMax[1], boundsMax[2]]
     : [0, 0, 0, 0, 0, 0];
 
-  return { meshes, materials, flatNodes, bounds };
+  const uniqueGeometries = new Set(meshes.map((mesh) => mesh.geometry));
+  return {
+    meshes,
+    materials,
+    flatNodes,
+    bounds,
+    dispose() {
+      for (const geometry of uniqueGeometries) arena.destroyGeometry(geometry);
+      uniqueGeometries.clear();
+    },
+  };
 }
 
 /**
@@ -372,19 +456,25 @@ export function sceneToRenderItems(
 ): RenderItem[] {
   const items: RenderItem[] = [];
 
-  // instanceData 的布局必须匹配管线的 [预留区 + mat4(64B) + 额外数据] 跨步，
-  // 否则 Renderer 会忽略这段数据（防止越界读出 NaN）。
+   // instanceData 的布局必须匹配管线的 [预留区 + mat4(64B) + 额外数据] 跨步，
+   // 否则 Renderer 会在提交前拒绝这段数据。
   const extraFloats = Math.max(
-    4,
+    0,
     (pipeline.bytesPerInstance - (pipeline.modelMatrixOffset || 0) - 64) >> 2,
   );
 
-  for (const mesh of scene.meshes) {
-    const mat = scene.materials[mesh.materialIndex];
-    // 附上材质 bind group 的 mesh 使用白色实例颜色（baseColorFactor 在 material uniform 中，
-    // 若实例颜色也带 factor 会被乘两次）。无材质时保持旧的纯色路径。
-    const bindGroup = materials?.has(mesh.materialIndex)
-      ? materials.bindGroupFor(mesh.materialIndex)
+   for (const mesh of scene.meshes) {
+     if (
+       mesh.materialIndex != null &&
+       (!Number.isSafeInteger(mesh.materialIndex) || mesh.materialIndex < 0 || mesh.materialIndex >= scene.materials.length)
+     ) {
+       throw new Error(`Imported mesh references invalid materialIndex ${mesh.materialIndex}.`);
+     }
+     const mat = mesh.materialIndex == null ? undefined : scene.materials[mesh.materialIndex];
+    const bindGroup = materials && pipeline.bindGroupLayouts.length > 2
+      ? mesh.materialIndex != null && materials.has(mesh.materialIndex)
+        ? materials.bindGroupFor(mesh.materialIndex)
+        : materials.defaultBindGroup?.()
       : undefined;
     const baseColor = bindGroup ? WHITE : mat?.baseColor ?? DEFAULT_BASE_COLOR;
 

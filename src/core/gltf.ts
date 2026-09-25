@@ -22,6 +22,7 @@ interface GltfAccessor {
   normalized?: boolean;
   min?: number[];
   max?: number[];
+  sparse?: unknown;
 }
 
 interface GltfBufferView {
@@ -175,7 +176,7 @@ export interface AssetPrimitive {
   /** 索引数据 (uint16 或 uint32)。 */
   indices: Uint16Array | Uint32Array;
   indexFormat: GPUIndexFormat;
-  materialIndex: number;
+  materialIndex?: number;
 }
 
 /**
@@ -266,30 +267,34 @@ function parseGlb(buffer: ArrayBuffer): { json: GltfRoot; bin: ArrayBuffer } {
   const version = view.getUint32(4, true);
   if (version !== 2) throw new Error(`Unsupported glTF version: ${version}`);
   const totalLength = view.getUint32(8, true);
+  if (totalLength !== buffer.byteLength) {
+    throw new Error(`Invalid GLB length: header declares ${totalLength}, buffer contains ${buffer.byteLength}.`);
+  }
 
   let jsonChunk: GltfRoot | null = null;
   let binChunk: ArrayBuffer | null = null;
   let offset = 12;
-
   while (offset < totalLength) {
+    if (totalLength - offset < 8) throw new Error('Invalid GLB chunk header.');
     const chunkLength = view.getUint32(offset, true);
     const chunkType = view.getUint32(offset + 4, true);
-    const chunkData = buffer.slice(offset + 8, offset + 8 + chunkLength);
-
+    if (chunkLength % 4 !== 0 || offset + 8 + chunkLength > totalLength) {
+      throw new Error('Invalid GLB chunk length.');
+    }
+    if (offset === 12 && chunkType !== 0x4E4F534A) throw new Error('GLB JSON chunk must be first.');
     if (chunkType === 0x4E4F534A) {
-      // JSON chunk
-      const text = new TextDecoder().decode(chunkData);
+      if (jsonChunk) throw new Error('GLB contains multiple JSON chunks.');
+      const text = new TextDecoder().decode(buffer.slice(offset + 8, offset + 8 + chunkLength));
       jsonChunk = JSON.parse(text) as GltfRoot;
     } else if (chunkType === 0x004E4942) {
-      // BIN chunk
-      binChunk = chunkData;
+      if (binChunk) throw new Error('GLB contains multiple BIN chunks.');
+      binChunk = buffer.slice(offset + 8, offset + 8 + chunkLength);
     }
-
     offset += 8 + chunkLength;
   }
-
+  if (offset !== totalLength) throw new Error('Invalid GLB chunk boundary.');
   if (!jsonChunk) throw new Error('No JSON chunk found in GLB');
-  return { json: jsonChunk, bin: binChunk! };
+  return { json: jsonChunk, bin: binChunk ?? new ArrayBuffer(0) };
 }
 
 // ─── Buffer Resolution ──────────────────────────────────────
@@ -338,18 +343,29 @@ function accessorLocation(
   bufferViews: GltfBufferView[],
   buffers: ArrayBuffer[],
 ): { buffer: ArrayBuffer; baseOffset: number; stride: number; elementSize: number; typeCount: number } {
-  const bv = bufferViews[accessor.bufferView]!;
-  const buffer = buffers[bv.buffer]!;
+  if (accessor.sparse != null) throw new Error('Sparse glTF accessors are not supported.');
+  if (!Number.isSafeInteger(accessor.count) || accessor.count < 0) throw new Error('Accessor count must be a non-negative safe integer.');
+  const bv = bufferViews[accessor.bufferView];
+  if (!bv) throw new Error(`Accessor references missing bufferView ${accessor.bufferView}.`);
+  const buffer = buffers[bv.buffer];
+  if (!buffer) throw new Error(`bufferView references missing buffer ${bv.buffer}.`);
+  const viewOffset = bv.byteOffset ?? 0;
+  if (!Number.isSafeInteger(viewOffset) || viewOffset < 0 || !Number.isSafeInteger(bv.byteLength) || bv.byteLength < 0 || viewOffset + bv.byteLength > buffer.byteLength) {
+    throw new Error(`bufferView ${accessor.bufferView} exceeds its buffer.`);
+  }
+  const accessorOffset = accessor.byteOffset ?? 0;
+  if (!Number.isSafeInteger(accessorOffset) || accessorOffset < 0) throw new Error('Accessor byteOffset must be non-negative.');
   const compSize = accessorComponentSize(accessor.componentType);
   const typeCount = accessorTypeCount(accessor.type);
   const elementSize = compSize * typeCount;
-  return {
-    buffer,
-    baseOffset: (bv.byteOffset ?? 0) + (accessor.byteOffset ?? 0),
-    stride: bv.byteStride && bv.byteStride > 0 ? bv.byteStride : elementSize,
-    elementSize,
-    typeCount,
-  };
+  const stride = bv.byteStride ?? elementSize;
+  if (!Number.isSafeInteger(stride) || stride < elementSize) throw new Error(`bufferView ${accessor.bufferView} has invalid byteStride.`);
+  const baseOffset = viewOffset + accessorOffset;
+  const end = accessor.count === 0 ? baseOffset : baseOffset + (accessor.count - 1) * stride + elementSize;
+  if (baseOffset < viewOffset || end > viewOffset + bv.byteLength) {
+    throw new Error(`Accessor ${accessor.bufferView} exceeds its bufferView.`);
+  }
+  return { buffer, baseOffset, stride, elementSize, typeCount };
 }
 
 /**
@@ -382,9 +398,8 @@ function readAccessorFloats(
   for (let i = 0; i < count; i++) {
     const rowBase = baseOffset + i * stride;
     for (let c = 0; c < typeCount; c++) {
-      const off = rowBase + c * (elementSize / typeCount);
-      if (off + elementSize / typeCount > buffer.byteLength) return out; // 截断保护
-      out[i * typeCount + c] = readComponent(dv, off, accessor.componentType, normalized);
+       const off = rowBase + c * (elementSize / typeCount);
+       out[i * typeCount + c] = readComponent(dv, off, accessor.componentType, normalized);
     }
   }
   return out;
@@ -400,46 +415,34 @@ function readIndices(
   buffers: ArrayBuffer[],
 ): { indices: Uint16Array | Uint32Array; format: GPUIndexFormat } {
   const componentType = accessor.componentType;
+  if (accessor.type !== 'SCALAR') throw new Error('Index accessor type must be SCALAR.');
   if (componentType !== 5121 && componentType !== 5123 && componentType !== 5125) {
     throw new Error(`Unsupported index componentType: ${componentType} (expected 5121/5123/5125)`);
   }
   const { buffer, baseOffset, stride, elementSize } = accessorLocation(accessor, bufferViews, buffers);
   const count = accessor.count;
-  const bytes = count * elementSize;
-  const aligned = baseOffset % 4 === 0 && baseOffset + bytes <= buffer.byteLength;
+  const aligned = stride === elementSize && baseOffset % 4 === 0 && baseOffset + count * elementSize <= buffer.byteLength;
 
-  if (aligned) {
-    if (componentType === 5125) {
-      return { indices: new Uint32Array(buffer, baseOffset, count), format: 'uint32' };
-    }
-    if (componentType === 5123 && baseOffset % 2 === 0) {
-      return { indices: new Uint16Array(buffer, baseOffset, count), format: 'uint16' };
-    }
-    if (componentType === 5121) {
-      const out = new Uint16Array(count);
-      out.set(new Uint8Array(buffer, baseOffset, count));
-      return { indices: out, format: 'uint16' };
-    }
+  if (aligned && componentType === 5125) {
+    return { indices: new Uint32Array(buffer, baseOffset, count), format: 'uint32' };
+  }
+  if (aligned && componentType === 5123 && baseOffset % 2 === 0) {
+    return { indices: new Uint16Array(buffer, baseOffset, count), format: 'uint16' };
+  }
+  if (aligned && componentType === 5121) {
+    const out = new Uint16Array(count);
+    out.set(new Uint8Array(buffer, baseOffset, count));
+    return { indices: out, format: 'uint16' };
   }
 
-  // 通用（复制）：处理非对齐 accessor。
   const dv = new DataView(buffer);
-  if (componentType === 5125) {
-    const out = new Uint32Array(count);
-    for (let i = 0; i < count; i++) {
-      const off = baseOffset + i * stride;
-      if (off + 4 > buffer.byteLength) break;
-      out[i] = dv.getUint32(off, true);
-    }
-    return { indices: out, format: 'uint32' };
-  }
-  const out = new Uint16Array(count);
+  const out = componentType === 5125 ? new Uint32Array(count) : new Uint16Array(count);
   for (let i = 0; i < count; i++) {
     const off = baseOffset + i * stride;
-    if (off + elementSize > buffer.byteLength) break;
-    out[i] = componentType === 5121 ? dv.getUint8(off) : dv.getUint16(off, true);
+    if (componentType === 5125) (out as Uint32Array)[i] = dv.getUint32(off, true);
+    else (out as Uint16Array)[i] = componentType === 5121 ? dv.getUint8(off) : dv.getUint16(off, true);
   }
-  return { indices: out, format: 'uint16' };
+  return { indices: out, format: componentType === 5125 ? 'uint32' : 'uint16' };
 }
 
 // ─── Matrix Helpers ─────────────────────────────────────────
@@ -629,10 +632,10 @@ function parseImages(
       const bv = bufferViews[img.bufferView];
       const buffer = bv ? buffers[bv.buffer] : undefined;
       if (!bv || !buffer) continue;
-      const start = bv.byteOffset ?? 0;
-      const end = Math.min(start + bv.byteLength, buffer.byteLength);
-      if (end <= start) continue;
-      const data = new Uint8Array(buffer.slice(start, end));
+       const start = bv.byteOffset ?? 0;
+       const end = start + bv.byteLength;
+       if (end <= start) continue;
+       const data = new Uint8Array(buffer.slice(start, end));
       images[i] = { name: `image-${i}`, mimeType: img.mimeType ?? sniffImageMime(data), data };
       continue;
     }
@@ -705,6 +708,20 @@ export function parseGltf(buffer: ArrayBuffer): GltfAsset {
     noteFeature(warnings, 'animation', `glTF 动画未播放（${json.animations!.length} 条）：只渲染静态场景。`);
   }
 
+  let nonzeroTextureTexCoord: number | undefined;
+  for (const mat of json.materials ?? []) {
+    const pbr = mat.pbrMetallicRoughness ?? {};
+    for (const ref of [pbr.baseColorTexture, pbr.metallicRoughnessTexture, mat.normalTexture, mat.occlusionTexture, mat.emissiveTexture]) {
+      if (ref?.texCoord != null && ref.texCoord !== 0) {
+        nonzeroTextureTexCoord ??= ref.texCoord;
+        break;
+      }
+    }
+  }
+  if (nonzeroTextureTexCoord !== undefined) {
+    noteFeature(warnings, 'texture-texcoord', `贴图 texCoord=${nonzeroTextureTexCoord} 被忽略：只使用 TEXCOORD_0。`);
+  }
+
   for (const mat of json.materials ?? []) {
     const pbr = mat.pbrMetallicRoughness ?? {};
     // MASK 已由材质管线实现（fragment discard）；BLEND 仍需要透明排序 / 混合策略，暂不支持。
@@ -715,10 +732,13 @@ export function parseGltf(buffer: ArrayBuffer): GltfAsset {
         'alphaMode=BLEND 未实现：被当作不透明渲染，会露出被遮挡的面。',
       );
     }
-    if (pbr.metallicRoughnessTexture || mat.normalTexture || mat.occlusionTexture || mat.emissiveTexture) {
-      noteFeature(warnings, 'pbr-textures', 'metallic-roughness / normal / occlusion / emissive 贴图未采样：光照细节丢失。');
-    }
-    for (const ext of Object.keys(mat.extensions ?? {})) {
+     if (pbr.metallicRoughnessTexture || mat.normalTexture || mat.occlusionTexture || mat.emissiveTexture) {
+       noteFeature(warnings, 'pbr-textures', 'metallic-roughness / normal / occlusion / emissive 贴图未采样：光照细节丢失。');
+     }
+     if (mat.doubleSided === true) {
+       noteFeature(warnings, 'double-sided', 'doubleSided=true 未实现：当前 pipeline 不执行材质级双面/背面法线语义。');
+     }
+     for (const ext of Object.keys(mat.extensions ?? {})) {
       // 与 asset 级扫描共用同一个 key / 文案：同一扩展只报一次。
       const hint = extensionHint(ext);
       if (hint) noteFeature(warnings, `ext:${ext}`, `glTF 扩展 ${ext} 未实现：${hint}。`);
@@ -733,19 +753,32 @@ export function parseGltf(buffer: ArrayBuffer): GltfAsset {
   if (declaredBuffers.length === 0) throw new Error('glTF asset declares no buffers.');
   for (let i = 0; i < declaredBuffers.length; i++) {
     const buf = declaredBuffers[i] as GltfBuffer;
-    if (i === 0 && bin) {
-      buffers.push(bin);
+    if (!Number.isSafeInteger(buf.byteLength) || buf.byteLength < 0) {
+      throw new Error(`Buffer ${i} has invalid byteLength.`);
+    }
+    if (i === 0) {
+      if (bin.byteLength < buf.byteLength) throw new Error(`GLB BIN chunk is shorter than buffer 0 (${bin.byteLength} < ${buf.byteLength}).`);
+      buffers.push(bin.slice(0, buf.byteLength));
     } else if (buf.uri) {
-      throw new Error(
-        `External buffer URI not supported: ${buf.uri}. Only self-contained .glb containers are supported.`,
-      );
+      throw new Error(`External buffer URI not supported: ${buf.uri}. Only self-contained .glb containers are supported.`);
     } else {
       throw new Error(`GLB has no BIN chunk for buffer ${i}.`);
     }
   }
 
-  const bufferViews = json.bufferViews ?? [];
-  const accessors = json.accessors ?? [];
+   const bufferViews = json.bufferViews ?? [];
+   const accessors = json.accessors ?? [];
+   for (let i = 0; i < bufferViews.length; i++) {
+    const view = bufferViews[i]!;
+    const buffer = buffers[view.buffer];
+    const offset = view.byteOffset ?? 0;
+    if (!buffer || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(view.byteLength) || view.byteLength < 0 || offset + view.byteLength > buffer.byteLength) {
+      throw new Error(`bufferView ${i} exceeds its buffer.`);
+    }
+    if (view.byteStride != null && (!Number.isSafeInteger(view.byteStride) || view.byteStride <= 0)) {
+      throw new Error(`bufferView ${i} has invalid byteStride.`);
+    }
+  }
 
   // Parse meshes
   const meshes: AssetMesh[] = [];
@@ -754,7 +787,8 @@ export function parseGltf(buffer: ArrayBuffer): GltfAsset {
     for (const prim of mesh.primitives) {
       // 只支持 TRIANGLES（mode 4）；其余拓扑类型直接跳过并提示。
       if (prim.mode !== undefined && prim.mode !== 4) {
-        warnOnce(
+        noteFeature(
+          warnings,
           `mode-${prim.mode}`,
           `Unsupported primitive mode ${prim.mode} (only 4 = TRIANGLES is supported); primitive skipped.`,
         );
@@ -762,10 +796,15 @@ export function parseGltf(buffer: ArrayBuffer): GltfAsset {
       }
 
       // Interleave attributes: POSITION + NORMAL + TEXCOORD_0 + TANGENT
-      const posIndex = prim.attributes.POSITION;
-      const posAcc = posIndex != null ? accessors[posIndex] : undefined;
+       for (const [name, accessorIndex] of Object.entries(prim.attributes)) {
+         if (!Number.isSafeInteger(accessorIndex) || accessorIndex < 0 || !accessors[accessorIndex]) {
+           throw new Error(`Primitive attribute ${name} references a missing accessor.`);
+         }
+       }
+       const posIndex = prim.attributes.POSITION;
+       const posAcc = posIndex != null ? accessors[posIndex] : undefined;
       if (!posAcc) {
-        warnOnce('no-position', 'Primitive without POSITION attribute skipped.');
+        noteFeature(warnings, 'no-position', 'Primitive without POSITION attribute skipped.');
         continue;
       }
       const normAcc = prim.attributes.NORMAL != null ? accessors[prim.attributes.NORMAL] : null;
@@ -789,12 +828,24 @@ export function parseGltf(buffer: ArrayBuffer): GltfAsset {
         noteFeature(warnings, 'morph-targets', 'morph target（变形目标）未实现：只渲染基础形状。');
       }
 
-      const posData = readAccessorFloats(posAcc, bufferViews, buffers);
-      const normData = normAcc ? readAccessorFloats(normAcc, bufferViews, buffers) : null;
-      const uvData = uvAcc ? readAccessorFloats(uvAcc, bufferViews, buffers) : null;
-      const tanData = tanAcc ? readAccessorFloats(tanAcc, bufferViews, buffers) : null;
+       const posData = readAccessorFloats(posAcc, bufferViews, buffers);
+       const normData = normAcc ? readAccessorFloats(normAcc, bufferViews, buffers) : null;
+       const uvData = uvAcc ? readAccessorFloats(uvAcc, bufferViews, buffers) : null;
+       const tanData = tanAcc ? readAccessorFloats(tanAcc, bufferViews, buffers) : null;
+       if (posAcc.type !== 'VEC3' || posData.length !== posAcc.count * 3) {
+         throw new Error('POSITION accessor must be VEC3 and fully readable.');
+       }
+       if (normAcc && (normAcc.type !== 'VEC3' || normData!.length !== posAcc.count * 3)) {
+         throw new Error('NORMAL accessor count must match POSITION and be VEC3.');
+       }
+       if (uvAcc && (uvAcc.type !== 'VEC2' || uvData!.length !== posAcc.count * 2)) {
+         throw new Error('TEXCOORD_0 accessor count must match POSITION and be VEC2.');
+       }
+       if (tanAcc && (tanAcc.type !== 'VEC4' || tanData!.length !== posAcc.count * 4)) {
+         throw new Error('TANGENT accessor count must match POSITION and be VEC4.');
+       }
 
-      const vertexCount = Math.min(posAcc.count, Math.floor(posData.length / 3));
+       const vertexCount = posAcc.count;
 
       // Build layout
       const attributes: { shaderLocation: number; offset: number; format: GPUVertexFormat }[] = [];
@@ -860,34 +911,42 @@ export function parseGltf(buffer: ArrayBuffer): GltfAsset {
       // Indices
       let indices: Uint16Array | Uint32Array;
       let indexFormat: GPUIndexFormat;
-      if (prim.indices != null) {
-        const idxAcc = accessors[prim.indices];
-        if (idxAcc) {
-          const read = readIndices(idxAcc, bufferViews, buffers);
-          indices = read.indices;
-          indexFormat = read.format;
-        } else {
-          warnOnce('bad-index-accessor', 'Primitive references a missing index accessor; indices generated.');
-          indices = generateSequentialIndices(vertexCount);
-          indexFormat = vertexCount > 65535 ? 'uint32' : 'uint16';
-        }
-      } else {
+       if (prim.indices != null) {
+         if (!Number.isSafeInteger(prim.indices) || prim.indices < 0 || prim.indices >= accessors.length) {
+           throw new Error(`Primitive references invalid index accessor ${prim.indices}.`);
+         }
+         const idxAcc = accessors[prim.indices]!;
+         const read = readIndices(idxAcc, bufferViews, buffers);
+         indices = read.indices;
+         indexFormat = read.format;
+       } else {
         // Non-indexed: generate 0,1,2,...（顶点数超过 uint16 范围时用 uint32）
         indices = generateSequentialIndices(vertexCount);
         indexFormat = vertexCount > 65535 ? 'uint32' : 'uint16';
       }
 
       if (indices.length === 0) {
-        warnOnce('empty-primitive', 'Primitive produced 0 indices; skipped.');
+        noteFeature(warnings, 'empty-primitive', 'Primitive produced 0 indices; skipped.');
         continue;
       }
+      if (indices.length % 3 !== 0) {
+        throw new Error('TRIANGLES primitive index count must be a multiple of 3.');
+      }
+      for (let i = 0; i < indices.length; i++) {
+        if ((indices[i] as number) >= vertexCount) {
+          throw new Error(`Index ${i} exceeds vertex count ${vertexCount}.`);
+        }
+      }
 
+      if (prim.material != null && (!Number.isSafeInteger(prim.material) || prim.material < 0 || prim.material >= (json.materials?.length ?? 0))) {
+        throw new Error(`Primitive references invalid material index ${prim.material}.`);
+      }
       primitives.push({
         vertices,
         vertexLayout: { arrayStride, attributes },
         indices,
         indexFormat,
-        materialIndex: prim.material ?? 0,
+        materialIndex: prim.material,
       });
     }
     meshes.push({ name: mesh.name ?? 'unnamed', primitives });

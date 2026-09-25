@@ -264,7 +264,7 @@ describe('Phase 15A — glTF 材质/贴图解析', () => {
 describe('Phase 15B — canonical layout 保留 TANGENT', () => {
   it('stride=48 且 4 个 location 全部声明；缺失 TANGENT 时填默认值', () => {
     const { renderer, recorded } = makeRenderer();
-    const scene = importGltfAsset(parseGltf(buildGlb()), renderer, { flipV: true });
+    const scene = importGltfAsset(parseGltf(buildGlb()), renderer, { flipV: false });
 
     expect(scene.meshes).toHaveLength(2);
     for (const mesh of scene.meshes) {
@@ -279,13 +279,13 @@ describe('Phase 15B — canonical layout 保留 TANGENT', () => {
     const floats = new Float32Array(vertexWrite!.bytes.buffer, vertexWrite!.bytes.byteOffset, 36);
     const tangent = Array.from(floats.slice(8, 12));
     for (let i = 0; i < 4; i++) expect(tangent[i]).toBeCloseTo(TANGENTS[i]!, 6);
-    // UV V 翻转只影响 uv.y（index 7），不影响 tangent。
-    expect(floats[7]).toBe(1); // 原 uv.y = 0 → 1
+    // 默认保持 glTF/WebGPU 共同的左上角 UV 原点。
+    expect(floats[7]).toBe(0);
   });
 
   it('imported material 搬运 baseColorTexture / alphaMode', () => {
     const { renderer } = makeRenderer();
-    const scene = importGltfAsset(parseGltf(buildGlb()), renderer, { flipV: true });
+    const scene = importGltfAsset(parseGltf(buildGlb()), renderer, { flipV: false });
 
     expect(scene.materials).toHaveLength(3);
     expect(scene.materials[0]!.baseColorTexture?.imageIndex).toBe(0);
@@ -372,6 +372,65 @@ describe('Phase 15A — MaterialStore', () => {
     store.dispose();
   });
 
+  it('srgb:false 使用线性纹理格式', async () => {
+    const { renderer, recorded } = makeRenderer();
+    const asset = parseGltf(buildGlb());
+    const store = await MaterialStore.create(renderer.device, asset, {
+      decode: async () => ({ width: 1, height: 1, data: new Uint8Array(4) }),
+    }, { srgb: false });
+    expect(recorded.textures.every((texture) => texture.format === 'rgba8unorm')).toBe(true);
+    store.dispose();
+  });
+
+  it('多个材质共享 image 时只解码和上传一次', async () => {
+    const { renderer, recorded } = makeRenderer();
+    const asset = parseGltf(buildGlb());
+    asset.materials.push({ ...asset.materials[0]!, name: 'Shared' });
+    const decode = vi.fn(async () => ({ width: 1, height: 1, data: new Uint8Array(4) }));
+    const store = await MaterialStore.create(renderer.device, asset, { decode });
+    expect(decode).toHaveBeenCalledTimes(1);
+    expect(store.stats.textures).toBe(1);
+    expect(recorded.textures.filter((texture) => texture.width === 1 && texture.height === 1)).toHaveLength(2);
+    store.dispose();
+  });
+
+  it('无 material 的资产提供默认 group=2 bind group', async () => {
+    const { renderer } = makeRenderer();
+    const asset = parseGltf(buildGlb());
+    asset.materials.length = 0;
+    const store = await MaterialStore.create(renderer.device, asset, {
+      decode: async () => ({ width: 1, height: 1, data: new Uint8Array(4) }),
+    });
+     const pipeline = registerMaterialPipeline(renderer, store.layout);
+     const scene = importGltfAsset(asset, renderer);
+     for (const mesh of scene.meshes) mesh.materialIndex = undefined;
+     const items = sceneToRenderItems(scene, pipeline, store);
+    expect(items[0]!.bindGroup).toBeDefined();
+    expect(() => renderer.submit(items)).not.toThrow();
+    store.dispose();
+    renderer.dispose();
+  });
+
+  it('显式非法 materialIndex 不会被静默替换为默认材质', () => {
+    const { renderer } = makeRenderer();
+    const asset = parseGltf(buildGlb());
+    const layout = uniformBindGroupLayout(renderer.device, [{ binding: 0, visibility: GPUShaderStage.VERTEX }]);
+    const uniform = renderer.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const pipeline = renderer.registerPipeline({
+      vsCode: VS_INSTANCED,
+      fsCode: FS_COLOR,
+      vertexLayouts: CANONICAL_LAYOUT,
+      bindGroupLayouts: [layout],
+      globalBindings: [{ binding: 0, buffer: uniform }],
+      targets: [{ format: FORMAT }],
+    });
+    const scene = importGltfAsset(asset, renderer);
+    scene.meshes[0]!.materialIndex = 999;
+    expect(() => sceneToRenderItems(scene, pipeline)).toThrow(/invalid materialIndex/);
+    scene.dispose();
+    renderer.dispose();
+  });
+
   it('暴露浏览器解码器工厂与材质布局工具', () => {
     expect(typeof createBrowserImageDecoder).toBe('function');
     const { device } = createFakeGPU();
@@ -402,7 +461,7 @@ describe('Phase 15A — 材质 bind group 落在 group 2', () => {
     });
     const pipeline = registerMaterialPipeline(renderer, store.layout);
 
-    const scene = importGltfAsset(asset, renderer, { flipV: true });
+    const scene = importGltfAsset(asset, renderer, { flipV: false });
     const items = sceneToRenderItems(scene, pipeline, store);
 
     expect(items).toHaveLength(2);
@@ -430,7 +489,7 @@ describe('Phase 15A — 材质 bind group 落在 group 2', () => {
       decode: async () => ({ width: 1, height: 1, data: new Uint8Array(4) }),
     });
     const pipeline = registerMaterialPipeline(renderer, store.layout);
-    const scene = importGltfAsset(asset, renderer, { flipV: true });
+    const scene = importGltfAsset(asset, renderer, { flipV: false });
     const items = sceneToRenderItems(scene, pipeline, store);
 
     renderer.submitDirect(items);
@@ -450,7 +509,7 @@ describe('Phase 15A — 材质 bind group 落在 group 2', () => {
       decode: async () => ({ width: 1, height: 1, data: new Uint8Array(4) }),
     });
     const pipeline = registerCulledMaterialPipeline(renderer, store.layout);
-    const scene = importGltfAsset(asset, renderer, { flipV: true });
+    const scene = importGltfAsset(asset, renderer, { flipV: false });
     const items = sceneToRenderItems(scene, pipeline, store);
 
     const stats = renderer.submitCulled(items, IDENTITY_VP);
@@ -484,7 +543,7 @@ describe('Phase 15A — 材质 bind group 落在 group 2', () => {
       targets: [{ format: FORMAT }],
     });
 
-    const scene = importGltfAsset(asset, renderer, { flipV: true });
+    const scene = importGltfAsset(asset, renderer, { flipV: false });
     const items = sceneToRenderItems(scene, pipeline);
     expect(items[0]!.bindGroup).toBeUndefined();
     // 无材质 → 实例颜色回落到 baseColorFactor。

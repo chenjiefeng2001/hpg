@@ -26,7 +26,9 @@ function buildGlb(opts: {
   accessors: unknown[];
   bufferViews: unknown[];
   primitives: unknown[];
+  materials?: unknown[];
   extensionsRequired?: string[];
+  binFirst?: boolean;
 }): ArrayBuffer {
   let binLength = 0;
   for (const s of opts.sections) binLength = Math.max(binLength, s.byteOffset + s.data.byteLength);
@@ -43,6 +45,7 @@ function buildGlb(opts: {
     accessors: opts.accessors,
     bufferViews: opts.bufferViews,
     buffers: [{ byteLength: binLength }],
+    ...(opts.materials ? { materials: opts.materials } : {}),
     ...(opts.extensionsRequired ? { extensionsRequired: opts.extensionsRequired } : {}),
   };
 
@@ -56,15 +59,24 @@ function buildGlb(opts: {
   dv.setUint32(0, 0x46546c67, true);
   dv.setUint32(4, 2, true);
   dv.setUint32(8, total, true);
-  dv.setUint32(12, jsonChunkLen, true);
-  dv.setUint32(16, 0x4e4f534a, true);
-  const jd = new Uint8Array(glb, 20, jsonChunkLen);
-  jd.set(jsonBytes);
-  for (let i = jsonBytes.byteLength; i < jsonChunkLen; i++) jd[i] = 0x20;
-  const binStart = 20 + jsonChunkLen;
-  dv.setUint32(binStart, binLength, true);
-  dv.setUint32(binStart + 4, 0x004e4942, true);
-  new Uint8Array(glb, binStart + 8, binLength).set(bin);
+  const chunks = opts.binFirst
+    ? [
+        { length: binLength, type: 0x004e4942, bytes: bin, pad: 0 },
+        { length: jsonChunkLen, type: 0x4e4f534a, bytes: jsonBytes, pad: 0x20 },
+      ]
+    : [
+        { length: jsonChunkLen, type: 0x4e4f534a, bytes: jsonBytes, pad: 0x20 },
+        { length: binLength, type: 0x004e4942, bytes: bin, pad: 0 },
+      ];
+  let offset = 12;
+  for (const chunk of chunks) {
+    dv.setUint32(offset, chunk.length, true);
+    dv.setUint32(offset + 4, chunk.type, true);
+    const dst = new Uint8Array(glb, offset + 8, chunk.length);
+    dst.set(chunk.bytes);
+    for (let i = chunk.bytes.byteLength; i < chunk.length; i++) dst[i] = chunk.pad;
+    offset += 8 + chunk.length;
+  }
   return glb;
 }
 
@@ -95,6 +107,27 @@ describe('glTF 解析健壮性', () => {
     const prim = asset.meshes[0]!.primitives[0]!;
     expect(prim.indexFormat).toBe('uint32');
     expect(Array.from(prim.indices)).toEqual([0, 1, 2]);
+  });
+
+  it('接受带 byteStride 的索引 accessor 并按步长读取', () => {
+    const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    const indexData = new Uint16Array([0, 0, 1, 0, 2, 0]);
+    const bin = new Uint8Array(positions.byteLength + indexData.byteLength);
+    bin.set(new Uint8Array(positions.buffer), 0);
+    bin.set(new Uint8Array(indexData.buffer), positions.byteLength);
+    const glb = buildGlb({
+      sections: [{ data: bin, byteOffset: 0 }],
+      bufferViews: [
+        { buffer: 0, byteOffset: 0, byteLength: positions.byteLength, target: 34962 },
+        { buffer: 0, byteOffset: positions.byteLength, byteLength: indexData.byteLength, byteStride: 4, target: 34963 },
+      ],
+      accessors: [
+        { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3' },
+        { bufferView: 1, componentType: 5123, count: 3, type: 'SCALAR' },
+      ],
+      primitives: [{ attributes: { POSITION: 0 }, indices: 1 }],
+    });
+    expect(Array.from(parseGltf(glb).meshes[0]!.primitives[0]!.indices)).toEqual([0, 1, 2]);
   });
 
   it('归一化整数属性被正确解码（1.0 表示最大值）', () => {
@@ -156,7 +189,7 @@ describe('glTF 解析健壮性', () => {
   });
 
   it('无索引 primitive 生成 uint32 顺序索引（顶点数超过 uint16 范围）', () => {
-    const count = 70000;
+    const count = 70002;
     const positions = new Float32Array(count * 3);
     const glb = buildGlb({
       sections: [{ data: new Uint8Array(positions.buffer), byteOffset: 0 }],
@@ -188,11 +221,11 @@ describe('glTF 解析健壮性', () => {
   });
 
   it('缺少 POSITION 的 primitive 被跳过', () => {
-    const positions = new Float32Array([0, 0, 0]);
+    const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
     const glb = buildGlb({
       sections: [{ data: new Uint8Array(positions.buffer), byteOffset: 0 }],
       bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: positions.byteLength, target: 34962 }],
-      accessors: [{ bufferView: 0, componentType: 5126, count: 1, type: 'VEC3' }],
+      accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: 'VEC3' }],
       primitives: [
         { attributes: { NORMAL: 0 } },
         { attributes: { POSITION: 0 } },
@@ -201,6 +234,61 @@ describe('glTF 解析健壮性', () => {
 
     const asset = parseGltf(glb);
     expect(asset.meshes[0]!.primitives.length).toBe(1);
+  });
+
+  it('primitive 未指定 material 时保留默认材质语义', () => {
+    const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    const glb = buildGlb({
+      sections: [{ data: new Uint8Array(positions.buffer), byteOffset: 0 }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: positions.byteLength, target: 34962 }],
+      accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: 'VEC3' }],
+      primitives: [{ attributes: { POSITION: 0 } }, { attributes: { POSITION: 0 }, material: 0 }],
+      materials: [{ pbrMetallicRoughness: { baseColorFactor: [1, 0, 0, 1] } }],
+    });
+    const asset = parseGltf(glb);
+    expect(asset.meshes[0]!.primitives[0]!.materialIndex).toBeUndefined();
+    expect(asset.meshes[0]!.primitives[1]!.materialIndex).toBe(0);
+  });
+
+  it('截断 accessor、稀疏 accessor 和错误索引范围显式拒绝', () => {
+    const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    const truncated = buildGlb({
+      sections: [{ data: new Uint8Array(positions.buffer), byteOffset: 0 }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: positions.byteLength - 4, target: 34962 }],
+      accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: 'VEC3' }],
+      primitives: [{ attributes: { POSITION: 0 } }],
+    });
+    expect(() => parseGltf(truncated)).toThrow(/bufferView/);
+
+    const invalidIndex = buildGlb({
+      sections: [{ data: new Uint8Array(positions.buffer), byteOffset: 0 }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: positions.byteLength, target: 34962 }],
+      accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: 'VEC3' }],
+      primitives: [{ attributes: { POSITION: 0 }, indices: 9 }],
+    });
+    expect(() => parseGltf(invalidIndex)).toThrow(/index accessor/);
+
+    const sparse = buildGlb({
+      sections: [{ data: new Uint8Array(positions.buffer), byteOffset: 0 }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: positions.byteLength, target: 34962 }],
+      accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', sparse: {} }],
+      primitives: [{ attributes: { POSITION: 0 } }],
+    });
+    expect(() => parseGltf(sparse)).toThrow(/Sparse/);
+  });
+
+  it('不被渲染路径引用的 sparse accessor 不会阻断 GLB', () => {
+    const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    const glb = buildGlb({
+      sections: [{ data: new Uint8Array(positions.buffer), byteOffset: 0 }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: positions.byteLength, target: 34962 }],
+      accessors: [
+        { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3' },
+        { componentType: 5126, count: 1, type: 'SCALAR', sparse: {} },
+      ],
+      primitives: [{ attributes: { POSITION: 0 } }],
+    });
+    expect(() => parseGltf(glb)).not.toThrow();
   });
 
   it('压缩扩展（Draco）给出可读错误而非静默乱码', () => {
@@ -214,6 +302,18 @@ describe('glTF 解析健壮性', () => {
     });
 
     expect(() => parseGltf(glb)).toThrow(/KHR_draco_mesh_compression/);
+  });
+
+  it('拒绝 BIN chunk 位于 JSON chunk 之前', () => {
+    const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    const glb = buildGlb({
+      binFirst: true,
+      sections: [{ data: new Uint8Array(positions.buffer), byteOffset: 0 }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: positions.byteLength, target: 34962 }],
+      accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: 'VEC3' }],
+      primitives: [{ attributes: { POSITION: 0 } }],
+    });
+    expect(() => parseGltf(glb)).toThrow(/JSON chunk must be first/);
   });
 
   it('文本 .gltf / 非 GLB 输入给出可读错误', () => {

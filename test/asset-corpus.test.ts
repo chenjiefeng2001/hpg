@@ -215,7 +215,7 @@ describe('Phase 11D — Direct 路径（submit）跑通全部真实资产', () =
     for (const { path, bytes } of CORPUS) {
       const { recorded, renderer } = makeRenderer();
       try {
-        const scene = importGltfAsset(parseGltf(bytes), renderer, { flipV: true });
+        const scene = importGltfAsset(parseGltf(bytes), renderer, { flipV: false });
         const items = sceneToRenderItems(scene, registerPipeline(renderer, false));
 
         if (items.length === 0) failures.push(`${path}: 0 render items`);
@@ -247,7 +247,7 @@ describe('Phase 11D — Direct 路径（submit）跑通全部真实资产', () =
     for (const { path, bytes } of CORPUS) {
       const { recorded, renderer } = makeRenderer();
       try {
-        const scene = importGltfAsset(parseGltf(bytes), renderer, { flipV: true });
+        const scene = importGltfAsset(parseGltf(bytes), renderer, { flipV: false });
         const items = sceneToRenderItems(scene, registerPipeline(renderer, false));
         renderer.submit(items);
 
@@ -275,7 +275,7 @@ describe('Phase 11D — GPU Culled 路径（submitCulled）跑通全部真实资
     for (const { path, bytes } of CORPUS) {
       const { recorded, renderer } = makeRenderer();
       try {
-        const scene = importGltfAsset(parseGltf(bytes), renderer, { flipV: true });
+        const scene = importGltfAsset(parseGltf(bytes), renderer, { flipV: false });
         if (scene.meshes.length === 0) continue;
         const items = sceneToRenderItems(scene, registerPipeline(renderer, true));
 
@@ -311,7 +311,7 @@ describe('Phase 11D — GPU Culled 路径（submitCulled）跑通全部真实资
       const direct = makeRenderer();
       const culled = makeRenderer();
       try {
-        const scene = importGltfAsset(parseGltf(bytes), direct.renderer, { flipV: true });
+        const scene = importGltfAsset(parseGltf(bytes), direct.renderer, { flipV: false });
         if (scene.meshes.length === 0) continue;
         const dItems = sceneToRenderItems(scene, registerPipeline(direct.renderer, false));
         const cItems = sceneToRenderItems(scene, registerPipeline(culled.renderer, true));
@@ -338,7 +338,7 @@ describe('Phase 11D — 世界空间包围盒 / 层级', () => {
     for (const { path, bytes } of CORPUS) {
       const { renderer } = makeRenderer();
       try {
-        const scene = importGltfAsset(parseGltf(bytes), renderer, { flipV: true });
+        const scene = importGltfAsset(parseGltf(bytes), renderer, { flipV: false });
         const [minX, minY, minZ, maxX, maxY, maxZ] = scene.bounds;
         if (![minX, minY, minZ, maxX, maxY, maxZ].every(Number.isFinite)) {
           failures.push(`${path}: bounds 含非有限值`);
@@ -362,8 +362,8 @@ describe('Phase 11D — 世界空间包围盒 / 层级', () => {
     const a = makeRenderer();
     const b = makeRenderer();
     try {
-      const scaled = importGltfAsset(parseGltf(bytes), a.renderer, { scale: 10, flipV: true });
-      const plain = importGltfAsset(parseGltf(bytes), b.renderer, { scale: 1, flipV: true });
+      const scaled = importGltfAsset(parseGltf(bytes), a.renderer, { scale: 10, flipV: false });
+      const plain = importGltfAsset(parseGltf(bytes), b.renderer, { scale: 1, flipV: false });
       for (let i = 0; i < 6; i++) expect(scaled.bounds[i]!).toBeCloseTo(plain.bounds[i]! * 10, 3);
       const m0 = scaled.meshes[0]!.worldMatrix;
       const m1 = plain.meshes[0]!.worldMatrix;
@@ -381,7 +381,7 @@ describe('Phase 11D — 多几何资产生成多个 draw', () => {
     for (const path of MULTI_GEOMETRY_MODELS) {
       const { recorded, renderer } = makeRenderer();
       try {
-        const scene = importGltfAsset(parseGltf(caseOf(path).bytes), renderer, { flipV: true });
+        const scene = importGltfAsset(parseGltf(caseOf(path).bytes), renderer, { flipV: false });
         const items = sceneToRenderItems(scene, registerPipeline(renderer, false));
         renderer.submit(items);
         expect(items.length).toBeGreaterThan(1);

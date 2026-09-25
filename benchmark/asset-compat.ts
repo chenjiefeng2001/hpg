@@ -544,9 +544,10 @@ export function renderReport(audits: AssetAudit[]): string {
   const matStatus = (name: string): string => {
     if (name === 'baseColorFactor') return 'supported';
     if (name === 'alphaMode:OPAQUE') return 'supported (default)';
-    if (name === 'doubleSided') return 'parsed, not used by pipeline';
-    if (name === 'baseColorTexture') return 'parsed (needs decoder)';
-    if (name === 'alphaMode:MASK') return 'sample + discard';
+     if (name === 'doubleSided') return 'warning; pipeline semantics not implemented';
+     if (name === 'baseColorTexture') return 'parsed (needs decoder)';
+     if (name === 'alphaMode:MASK') return 'sample + discard';
+     if (name === 'alphaCutoff') return 'used by MASK discard';
     return 'IGNORED';
   };
   for (const name of matNames) {

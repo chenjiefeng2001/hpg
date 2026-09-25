@@ -5,7 +5,7 @@
  *        ↓  ImageDecoder（可注入：浏览器 / Node / 测试替身）
  *   DecodedImage (RGBA8)
  *        ↓  uploadImageTextures
- *   GPUTexture (sRGB) + GPUSampler
+ *   GPUTexture (sRGB by default) + GPUSampler
  *        ↓  createMaterialBindGroup
  *   MaterialStore.bindGroupFor(idx)
  *        ↓  RenderItem.bindGroup → group(2)
@@ -149,11 +149,11 @@ function samplerFromAsset(device: GPUDevice, s: AssetSampler, label: string): GP
 }
 
 /** 1×1 白色纹理 —— 让「无贴图材质」与「有贴图材质」共用同一条采样路径。 */
-function createWhiteTexture(device: GPUDevice, label: string): GPUTexture {
+function createWhiteTexture(device: GPUDevice, label: string, format: GPUTextureFormat): GPUTexture {
   const texture = device.createTexture({
     label: `${label}:white`,
     size: { width: 1, height: 1, depthOrArrayLayers: 1 },
-    format: COLOR_FORMAT,
+    format,
     usage: textureUsage(),
   });
   device.queue.writeTexture(
@@ -165,11 +165,11 @@ function createWhiteTexture(device: GPUDevice, label: string): GPUTexture {
   return texture;
 }
 
-function uploadImage(device: GPUDevice, image: DecodedImage, label: string): GPUTexture {
+function uploadImage(device: GPUDevice, image: DecodedImage, label: string, format: GPUTextureFormat): GPUTexture {
   const texture = device.createTexture({
     label,
     size: { width: image.width, height: image.height, depthOrArrayLayers: 1 },
-    format: COLOR_FORMAT,
+    format,
     usage: textureUsage(),
   });
   device.queue.writeTexture(
@@ -204,7 +204,7 @@ export interface MaterialStoreOptions {
  * 使用：
  *   const store = await MaterialStore.create(device, asset, createBrowserImageDecoder());
  *   renderer.registerPipeline({ bindGroupLayouts: [globalLayout, store.layout], ... });
- *   const items = sceneToRenderItems(scene, pipeline, globals, store);
+ *   const items = sceneToRenderItems(scene, pipeline, store);
  */
 export class MaterialStore {
   /** 与管线 bindGroupLayouts[1]（→ group=2）配对的布局。 */
@@ -212,15 +212,20 @@ export class MaterialStore {
   readonly stats: MaterialStoreStats = { materials: 0, textures: 0, skipped: [] };
 
   private _bindGroups: (GPUBindGroup | undefined)[] = [];
+  private _device: GPUDevice;
   private _textures: GPUTexture[] = [];
   private _uniforms: GPUBuffer[] = [];
   private _white: GPUTexture;
+  private _format: GPUTextureFormat;
+  private _defaultBindGroup: GPUBindGroup | null = null;
   private _defaultSampler: GPUSampler;
   private _disposed = false;
 
-  private constructor(device: GPUDevice, label: string) {
+  private constructor(device: GPUDevice, label: string, format: GPUTextureFormat) {
+    this._device = device;
     this.layout = createMaterialBindGroupLayout(device, `${label}:material-layout`);
-    this._white = createWhiteTexture(device, label);
+    this._format = format;
+    this._white = createWhiteTexture(device, label, format);
     this._defaultSampler = device.createSampler({
       label: `${label}:default-sampler`,
       magFilter: 'linear',
@@ -239,9 +244,10 @@ export class MaterialStore {
     opts: MaterialStoreOptions = {},
   ): Promise<MaterialStore> {
     const label = opts.label ?? 'hpg';
-    const store = new MaterialStore(device, label);
-    // 同一 image 可能被多个材质共用（texture atlas / 复用贴图）→ 只解码上传一次。
+    const format: GPUTextureFormat = opts.srgb === false ? 'rgba8unorm' : COLOR_FORMAT;
+    const store = new MaterialStore(device, label, format);
     const decodedCache = new Map<number, DecodedImage | null>();
+    const textureCache = new Map<number, GPUTexture>();
 
     for (let i = 0; i < asset.materials.length; i++) {
       const material = asset.materials[i] as AssetMaterial;
@@ -264,11 +270,18 @@ export class MaterialStore {
             }
             decodedCache.set(ref.imageIndex, decoded);
           }
-          if (decoded) {
-            texture = uploadImage(device, decoded, `${label}:tex:${ref.imageIndex}`);
-            sampler = samplerFromAsset(device, ref.sampler, `${label}:sampler:${ref.imageIndex}`);
-            store._textures.push(texture);
-          }
+           if (decoded) {
+             const cachedTexture = textureCache.get(ref.imageIndex);
+             if (cachedTexture) {
+               texture = cachedTexture;
+             } else {
+               texture = uploadImage(device, decoded, `${label}:tex:${ref.imageIndex}`, format);
+               textureCache.set(ref.imageIndex, texture);
+               store._textures.push(texture);
+               store.stats.textures++;
+             }
+             sampler = samplerFromAsset(device, ref.sampler, `${label}:sampler:${ref.imageIndex}`);
+           }
         }
       }
 
@@ -284,7 +297,7 @@ export class MaterialStore {
         ],
       });
       store.stats.materials++;
-      if (texture !== store._white) store.stats.textures++;
+       if (texture !== store._white && !store._textures.includes(texture)) store.stats.textures++;
     }
 
     return store;
@@ -300,6 +313,32 @@ export class MaterialStore {
     return this._bindGroups[materialIndex];
   }
 
+  defaultBindGroup(): GPUBindGroup {
+    if (this._disposed) throw new Error('MaterialStore 已 dispose。');
+    if (this._defaultBindGroup) return this._defaultBindGroup;
+    const material: AssetMaterial = {
+      name: 'default',
+      baseColorFactor: [1, 1, 1, 1],
+      metallicFactor: 1,
+      roughnessFactor: 1,
+      doubleSided: false,
+      alphaMode: 'OPAQUE',
+      alphaCutoff: 0.5,
+    };
+    const uniform = createMaterialUniformBuffer(this._device, material, 'hpg:default-material');
+    this._uniforms.push(uniform);
+    this._defaultBindGroup = this._device.createBindGroup({
+      label: 'hpg:default-material-bg',
+      layout: this.layout,
+      entries: [
+        { binding: 0, resource: this._white.createView() },
+        { binding: 1, resource: this._defaultSampler },
+        { binding: 2, resource: { buffer: uniform } },
+      ],
+    });
+    return this._defaultBindGroup;
+  }
+
   dispose(): void {
     if (this._disposed) return;
     this._disposed = true;
@@ -308,6 +347,7 @@ export class MaterialStore {
     for (const u of this._uniforms) u.destroy();
     this._uniforms.length = 0;
     this._white.destroy();
+    this._defaultBindGroup = null;
     this._bindGroups = [];
   }
 }
