@@ -19,6 +19,14 @@ describe('math', () => {
     expect(p[11]).toBe(-1);
   });
 
+  it('perspective maps the WebGPU near and far planes to 0 and 1', () => {
+    const p = perspective(Math.PI / 2, 1, 0.1, 100);
+    const nearZ = (p[10]! * -0.1 + p[14]!) / 0.1;
+    const farZ = (p[10]! * -100 + p[14]!) / 100;
+    expect(nearZ).toBeCloseTo(0, 6);
+    expect(farZ).toBeCloseTo(1, 6);
+  });
+
   it('multiply(C) = A*B satisfies C*v = A*(B*v)', () => {
     const a = rotationY(new Float32Array(16), 0.7);
     const b = rotationY(new Float32Array(16), 1.2);
@@ -142,22 +150,23 @@ describe('math', () => {
   // ──────────────────────────────────────────────
 
   describe('orthographic', () => {
-    it('maps (left,right,bottom,top,near,far) to [-1,1] NDC', () => {
+    it('maps near/far to WebGPU NDC [0,1]', () => {
       const out = new Float32Array(16);
       orthographic(out, 0, 800, 600, 0, 0.1, 100);
-      // (0,600,0.1) → top-left near → should map to NDC (-1, -1, ~0)
-      // (800,0,100) → bottom-right far → should map to NDC (1, 1, ~1)
-      expect(out[0]).toBeCloseTo(2 / 800, 6); // 2/(right-left)
-      expect(out[5]).toBeCloseTo(2 / -600, 6); // 2/(bottom-top) negative because top<bottom
+      expect(out[0]).toBeCloseTo(2 / 800, 6);
+      expect(out[5]).toBeCloseTo(2 / -600, 6);
+      expect(out[10]).toBeCloseTo(1 / (0.1 - 100), 6);
+      expect(out[14]).toBeCloseTo(0.1 / (0.1 - 100), 6);
       expect(out[15]).toBeCloseTo(1, 6);
     });
 
-    it('identity-like for symmetric range [-1,1]', () => {
+    it('maps the depth endpoints to 0 and 1', () => {
       const out = new Float32Array(16);
-      orthographic(out, -1, 1, -1, 1, 0, 1);
-      expect(out[0]).toBeCloseTo(1, 6);
-      expect(out[5]).toBeCloseTo(1, 6);
-      expect(out[10]).toBeCloseTo(-2, 6); // 2/(near-far) = 2/(0-1) = -2
+      orthographic(out, -1, 1, -1, 1, 0.1, 1.1);
+      const nearZ = out[10]! * -0.1 + out[14]!;
+      const farZ = out[10]! * -1.1 + out[14]!;
+      expect(nearZ).toBeCloseTo(0, 6);
+      expect(farZ).toBeCloseTo(1, 6);
     });
 
     it('preserves out[3,7,11] = 0', () => {

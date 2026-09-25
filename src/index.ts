@@ -11,7 +11,7 @@ export * from './core/math';
 
 // Core API
 export { Renderer, uniformBindGroupLayout } from './core/renderer';
-export type { RendererOptions, RendererDescriptor } from './core/renderer';
+export type { RendererOptions, RendererDescriptor, SubmitOptions } from './core/renderer';
 export { GeometryArena } from './core/geometry';
 export type { GeometryArenaStats } from './core/geometry';
 export { TimestampQuery } from './core/timestamp';
@@ -49,6 +49,7 @@ export type {
   AssetImage,
   AssetSampler,
   AssetTextureRef,
+  FlattenedNode,
 } from './core/gltf';
 export { importGltfAsset, sceneToRenderItems } from './core/asset-importer';
 export type {

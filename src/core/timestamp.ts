@@ -3,12 +3,13 @@
  *
  * 用法：
  *   const tq = new TimestampQuery(device, 2);
- *   tq.writeTimestamp(pass, 0);   // pass 开始前
- *   // ... draw calls ...
- *   tq.writeTimestamp(pass, 1);   // pass 结束前
+ *   const pass = encoder.beginRenderPass({
+ *     colorAttachments,
+ *     timestampWrites: tq.timestampWrites(0, 1),
+ *   });
  *   tq.resolve(encoder);
  *   device.queue.submit([encoder.finish()]);
- *   const ns = await tq.readback();  // 异步回读 GPU 耗时（纳秒）
+ *   const ns = await tq.readback(device);  // 异步回读 GPU 耗时（纳秒）
  */
 
 export class TimestampQuery {
@@ -16,33 +17,62 @@ export class TimestampQuery {
   private _resolveBuffer: GPUBuffer;
   private _stagingBuffer: GPUBuffer | null = null;
   private _pending = false;
+  private _disposed = false;
   private _count: number;
 
   constructor(device: GPUDevice, count = 2, label = 'hpg:timestamp') {
+    if (device.features && !device.features.has('timestamp-query')) {
+      throw new Error('TimestampQuery requires the timestamp-query device feature.');
+    }
     this._count = count;
-    this.querySet = device.createQuerySet({
+    const querySet = device.createQuerySet({
       type: 'timestamp',
       count,
       label,
     });
-    // 8 bytes per query (u64 timestamp).
-    this._resolveBuffer = device.createBuffer({
-      size: count * 8,
-      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
-      label: `${label}:resolve`,
-    });
+    let resolveBuffer: GPUBuffer;
+    try {
+      // 8 bytes per query (u64 timestamp).
+      resolveBuffer = device.createBuffer({
+        size: count * 8,
+        usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+        label: `${label}:resolve`,
+      });
+    } catch (error) {
+      try {
+        querySet.destroy();
+      } catch {}
+      throw error;
+    }
+    this.querySet = querySet;
+    this._resolveBuffer = resolveBuffer;
   }
 
-  /** 在 render/compute pass 中写入时间戳到指定 slot。 */
-  writeTimestamp(pass: GPURenderPassEncoder | GPUComputePassEncoder, index: number): void {
-    // WebGPU spec: writeTimestamp is on GPUBindingCommandsMixin (both render & compute passes).
-    // TypeScript types may not include it yet.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (pass as any).writeTimestamp(this.querySet, index);
+  timestampWrites(beginningOfPassWriteIndex = 0, endOfPassWriteIndex = this._count - 1): {
+    querySet: GPUQuerySet;
+    beginningOfPassWriteIndex: number;
+    endOfPassWriteIndex: number;
+  } {
+    if (this._disposed) throw new Error('TimestampQuery has been destroyed.');
+    if (
+      !Number.isSafeInteger(beginningOfPassWriteIndex) ||
+      !Number.isSafeInteger(endOfPassWriteIndex) ||
+      beginningOfPassWriteIndex < 0 ||
+      endOfPassWriteIndex <= beginningOfPassWriteIndex ||
+      endOfPassWriteIndex >= this._count
+    ) {
+      throw new Error('TimestampQuery timestamp write indices are out of range.');
+    }
+    return {
+      querySet: this.querySet,
+      beginningOfPassWriteIndex,
+      endOfPassWriteIndex,
+    };
   }
 
   /** 将 QuerySet 解析到 resolve buffer。在 encoder.finish() 前调用。 */
   resolve(encoder: GPUCommandEncoder): void {
+    if (this._disposed) throw new Error('TimestampQuery has been destroyed.');
     encoder.resolveQuerySet(this.querySet, 0, this._count, this._resolveBuffer, 0);
   }
 
@@ -52,43 +82,67 @@ export class TimestampQuery {
    * 返回一个 Promise<number[]> —— 每个 slot 的 GPU 时间戳（ns）。
    */
   async readback(device: GPUDevice): Promise<number[]> {
+    if (this._disposed) throw new Error('TimestampQuery has been destroyed.');
     if (this._pending) throw new Error('TimestampQuery: previous readback still pending');
 
-    // 创建 staging buffer（COPY_DST + MAP_READ）。
-    const size = this._count * 8;
-    this._stagingBuffer = device.createBuffer({
-      size,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      label: 'hpg:timestamp:staging',
-    });
-
-    const encoder = device.createCommandEncoder();
-    encoder.copyBufferToBuffer(this._resolveBuffer, 0, this._stagingBuffer, 0, size);
-    device.queue.submit([encoder.finish()]);
-
     this._pending = true;
-    await this._stagingBuffer.mapAsync(GPUMapMode.READ);
-    const data = this._stagingBuffer.getMappedRange();
-    const timestamps: number[] = [];
-    const view = new DataView(data);
-    for (let i = 0; i < this._count; i++) {
-      // WebGPU timestamps 是 BigUint64，JavaScript 安全整数范围足够（<53 bits）。
-      timestamps.push(Number(view.getBigUint64(i * 8, false)));
+    let stagingBuffer: GPUBuffer | null = null;
+    let mapped = false;
+    try {
+      // 创建 staging buffer（COPY_DST + MAP_READ）。
+      const size = this._count * 8;
+      stagingBuffer = device.createBuffer({
+        size,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        label: 'hpg:timestamp:staging',
+      });
+      this._stagingBuffer = stagingBuffer;
+
+      const encoder = device.createCommandEncoder();
+      encoder.copyBufferToBuffer(this._resolveBuffer, 0, stagingBuffer, 0, size);
+      device.queue.submit([encoder.finish()]);
+
+      await stagingBuffer.mapAsync(GPUMapMode.READ);
+      mapped = true;
+      const data = stagingBuffer.getMappedRange();
+      const timestamps: number[] = [];
+      const view = new DataView(data);
+      for (let i = 0; i < this._count; i++) {
+        // WebGPU timestamps 是 BigUint64，JavaScript 安全整数范围足够（<53 bits）。
+        timestamps.push(Number(view.getBigUint64(i * 8, false)));
+      }
+      return timestamps;
+    } finally {
+      if (stagingBuffer) {
+        if (mapped) {
+          try {
+            stagingBuffer.unmap();
+          } catch {}
+        }
+        try {
+          stagingBuffer.destroy();
+        } catch {}
+      }
+      this._stagingBuffer = null;
+      this._pending = false;
     }
-    this._stagingBuffer.unmap();
-    this._stagingBuffer.destroy();
-    this._stagingBuffer = null;
-    this._pending = false;
-    return timestamps;
   }
 
   /** 释放 GPU 资源。 */
   destroy(): void {
-    this.querySet.destroy();
-    this._resolveBuffer.destroy();
-    if (this._stagingBuffer) {
-      this._stagingBuffer.destroy();
-      this._stagingBuffer = null;
+    if (this._disposed) return;
+    if (this._pending) throw new Error('TimestampQuery cannot be destroyed while readback is pending.');
+    this._disposed = true;
+    const stagingBuffer = this._stagingBuffer;
+    this._stagingBuffer = null;
+    try {
+      this.querySet.destroy();
+    } finally {
+      try {
+        this._resolveBuffer.destroy();
+      } finally {
+        stagingBuffer?.destroy();
+      }
     }
   }
 }

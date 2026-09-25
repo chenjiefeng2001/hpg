@@ -18,6 +18,7 @@ import type { Batch } from './commands';
 import { countingSortKeys, packKeyValue, DEFAULT_LAYER } from './keygen';
 import { CullingPipeline } from './culling';
 import { TimestampQuery } from './timestamp';
+import { VS_INSTANCED, VS_INSTANCED_MATERIAL, VS_INSTANCED_COMPACTION, VS_INSTANCED_MATERIAL_COMPACTION } from '../shaders/instance';
 
 /** submit() 的可选参数。 */
 export interface SubmitOptions {
@@ -46,10 +47,49 @@ export interface RendererDescriptor extends RendererOptions {
 
 const DEFAULT_CLEAR: [number, number, number, number] = [0.05, 0.06, 0.09, 1];
 
+function normalizeShaderSource(code: string): string {
+  return code
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isCompactionShader(code: string): boolean {
+  const normalized = normalizeShaderSource(code);
+  return normalized === normalizeShaderSource(VS_INSTANCED_COMPACTION) || normalized === normalizeShaderSource(VS_INSTANCED_MATERIAL_COMPACTION);
+}
+
+function isBuiltInInstanceShader(code: string): boolean {
+  const normalized = normalizeShaderSource(code);
+  return normalized === normalizeShaderSource(VS_INSTANCED) || normalized === normalizeShaderSource(VS_INSTANCED_MATERIAL) || isCompactionShader(code);
+}
+
 function assertCompactionPipeline(item: RenderItem): void {
   if (item.pipeline.desc.compaction !== true) {
     throw new Error(`Pipeline "${item.pipeline.label}" must be registered with compaction: true for submitCulled().`);
   }
+}
+
+function assertDirectPipeline(item: RenderItem): void {
+  if (item.pipeline.desc.compaction === true) {
+    throw new Error(`Pipeline "${item.pipeline.label}" is a compaction pipeline and can only be used with submitCulled().`);
+  }
+}
+
+function assertAffineTransforms(item: RenderItem): void {
+  if (!item.transforms) return;
+  for (let i = 0; i < item.transforms.length; i += 16) {
+    const m = item.transforms;
+    if (Math.abs(m[i + 3] as number) > 1e-6 || Math.abs(m[i + 7] as number) > 1e-6 || Math.abs(m[i + 11] as number) > 1e-6 || Math.abs((m[i + 15] as number) - 1) > 1e-6) {
+      throw new Error('submitCulled only supports affine transforms.');
+    }
+  }
+}
+
+function expectedInstanceDataFloats(item: RenderItem): number {
+  const extraBytes = item.pipeline.bytesPerInstance - item.pipeline.modelMatrixOffset - 64;
+  return extraBytes / 4;
 }
 
 function assertFiniteValues(values: ArrayLike<number>, name: string): void {
@@ -63,8 +103,8 @@ function validateRenderItem(item: RenderItem): void {
     throw new Error('RenderItem.transforms length must be a multiple of 16.');
   }
   const count = instanceCountOf(item);
-  if (!Number.isSafeInteger(count) || count < 0) {
-    throw new Error('RenderItem.instanceCount must be a non-negative safe integer.');
+  if (!Number.isSafeInteger(count) || count <= 0) {
+    throw new Error('RenderItem.instanceCount must be a positive safe integer.');
   }
   if (item.transforms) {
     if (count > item.transforms.length / 16) {
@@ -72,10 +112,39 @@ function validateRenderItem(item: RenderItem): void {
     }
     assertFiniteValues(item.transforms, 'RenderItem.transforms');
   }
-  if (item.instanceData) assertFiniteValues(item.instanceData, 'RenderItem.instanceData');
+  if (item.instanceData) {
+    assertFiniteValues(item.instanceData, 'RenderItem.instanceData');
+    const expected = count * expectedInstanceDataFloats(item);
+    if (item.instanceData.length !== expected) {
+      throw new Error(`RenderItem.instanceData length must equal instanceCount * extra floats (${expected}).`);
+    }
+  }
   const topology = item.pipeline.desc.primitive?.topology ?? 'triangle-list';
   if (item.geometry.primitive !== topology) {
     throw new Error(`RenderItem geometry primitive ${item.geometry.primitive} does not match pipeline topology ${topology}.`);
+  }
+  const pipelineLayouts = item.pipeline.desc.vertexLayouts;
+  if (pipelineLayouts.length !== item.geometry.vertexLayouts.length) {
+    throw new Error('Geometry and pipeline vertex layout counts do not match.');
+  }
+  for (let i = 0; i < pipelineLayouts.length; i++) {
+    const geometryLayout = item.geometry.vertexLayouts[i]!;
+    const pipelineLayout = pipelineLayouts[i]!;
+    if (geometryLayout.arrayStride !== pipelineLayout.arrayStride || geometryLayout.stepMode !== pipelineLayout.stepMode) {
+      throw new Error(`Geometry and pipeline vertex layout ${i} do not match.`);
+    }
+    for (const pipelineAttribute of pipelineLayout.attributes) {
+      const geometryAttribute = geometryLayout.attributes.find((attribute) => attribute.shaderLocation === pipelineAttribute.shaderLocation);
+      if (!geometryAttribute || geometryAttribute.offset !== pipelineAttribute.offset || geometryAttribute.format !== pipelineAttribute.format) {
+        throw new Error(`Geometry and pipeline vertex attribute ${i}:${pipelineAttribute.shaderLocation} do not match.`);
+      }
+    }
+  }
+  if (topology.endsWith('-strip') && item.geometry.indexSlice && item.pipeline.desc.primitive?.stripIndexFormat !== item.geometry.indexFormat) {
+    throw new Error('Indexed strip geometry requires a matching pipeline stripIndexFormat.');
+  }
+  if (item.geometry.indexSlice && !item.geometry.indexBuffer) {
+    throw new Error('Geometry indexSlice requires an indexBuffer.');
   }
   if (item.depth !== undefined && !Number.isFinite(item.depth)) {
     throw new Error('RenderItem.depth must be finite.');
@@ -108,7 +177,8 @@ export class Renderer {
     instanceSize: number;
     slotSize: number;
   } | null = null;
-  private globalBGs = new Map<number, GPUBindGroup>();
+  private globalBGs = new Map<ResolvedPipeline, GPUBindGroup>();
+  private ownedPipelines = new WeakSet<ResolvedPipeline>();
 
   private sortedItems: RenderItem[] = [];
   private orderScratch: Int32Array = new Int32Array(0);
@@ -161,6 +231,12 @@ export class Renderer {
     this.presentationFormat = presentationFormat;
     this.clearColor = opts.clearColor ?? DEFAULT_CLEAR;
     this.depthFormat = opts.depthFormat ?? 'depth24plus';
+    if (this.depthFormat.includes('stencil')) {
+      throw new Error('Renderer currently supports depth-only formats without stencil attachments.');
+    }
+    if (this.depthFormat !== 'depth16unorm' && this.depthFormat !== 'depth24plus' && this.depthFormat !== 'depth32float') {
+      throw new Error(`Renderer depthFormat must be a depth-only format, received ${this.depthFormat}.`);
+    }
     this.label = opts.label ?? 'hpg';
 
     this.arena = new GeometryArena(device);
@@ -264,6 +340,23 @@ export class Renderer {
     if (this._disposed) throw new Error(`[hpg] Renderer 已 dispose，${method}() 不可再用。`);
   }
 
+  private assertPresentationFormat(method: string): void {
+    const configuration = this.context.getConfiguration?.();
+    if (!configuration) {
+      throw new Error(`[hpg] ${method}() requires a configured GPUCanvasContext.`);
+    }
+    if (configuration.format !== this.presentationFormat) {
+      throw new Error(`[hpg] ${method}() context format ${configuration.format} does not match presentation format ${this.presentationFormat}.`);
+    }
+    if (configuration.device && configuration.device !== this.device) {
+      throw new Error(`[hpg] ${method}() context is configured for a different GPUDevice.`);
+    }
+    const usage = configuration.usage ?? GPUTextureUsage.RENDER_ATTACHMENT;
+    if ((usage & GPUTextureUsage.RENDER_ATTACHMENT) === 0) {
+      throw new Error(`[hpg] ${method}() context usage must include RENDER_ATTACHMENT.`);
+    }
+  }
+
   /**
    * 注册管线（内容哈希缓存）。返回句柄可直接在 RenderItem 中使用。
    *
@@ -276,6 +369,7 @@ export class Renderer {
    * 得到 `[global, instance, material]` —— 材质恰好落在 group 2（`RenderItem.bindGroup`）。
    */
   registerPipeline(desc: PipelineDesc): ResolvedPipeline {
+    this.assertUsable('registerPipeline');
     if (desc.bindGroupLayouts.length === 0) {
       throw new Error(`[hpg] 管线 "${desc.label ?? 'unnamed'}" 至少需要一个 group 0 layout。`);
     }
@@ -285,6 +379,13 @@ export class Renderer {
     if (desc.targets.length !== 1) {
       throw new Error(`[hpg] 管线 "${desc.label ?? 'unnamed'}" 当前只支持一个 color target。`);
     }
+    if (desc.targets[0]!.format !== this.presentationFormat) {
+      throw new Error(`[hpg] 管线 "${desc.label ?? 'unnamed'}" 的 target format ${desc.targets[0]!.format} 与 presentation format ${this.presentationFormat} 不一致。`);
+    }
+    if (desc.vertexLayouts.length !== 1 || desc.vertexLayouts[0]!.stepMode !== 'vertex') {
+      throw new Error(`[hpg] 管线 "${desc.label ?? 'unnamed'}" 当前只支持一个 vertex-step layout。`);
+    }
+    assertGlobalBindings(this.device, desc.globalBindings);
     if (desc.bindGroupLayouts.length > 2) {
       throw new Error(`[hpg] 管线 "${desc.label ?? 'unnamed'}" 当前只支持 group 0 和一个额外 group 2。`);
     }
@@ -304,15 +405,24 @@ export class Renderer {
         `[hpg] 管线 "${desc.label ?? 'unnamed'}" 的 modelMatrixOffset=${mmo} 必须是非负的 16 的倍数（mat4x4<f32> 对齐）。`,
       );
     }
-    if (!Number.isSafeInteger(bpi) || bpi < 64 || bpi % 4 !== 0) {
+    if (!Number.isSafeInteger(bpi) || bpi < 64 || bpi % 16 !== 0) {
       throw new Error(
-        `[hpg] 管线 "${desc.label ?? 'unnamed'}" 的 bytesPerInstance=${bpi} 必须是至少 64 且按 4 字节对齐的安全整数。`,
+        `[hpg] 管线 "${desc.label ?? 'unnamed'}" 的 bytesPerInstance=${bpi} 必须是至少 64 且按 16 字节对齐的安全整数。`,
       );
     }
     if (bpi < mmo + 64) {
       throw new Error(
         `[hpg] 管线 "${desc.label ?? 'unnamed'}" 的 bytesPerInstance=${bpi} 必须 ≥ modelMatrixOffset(${mmo}) + 64。`,
       );
+    }
+    if (isBuiltInInstanceShader(desc.vsCode) && (bpi !== 80 || mmo !== 0)) {
+      throw new Error(`[hpg] 内置实例着色器要求 bytesPerInstance=80 且 modelMatrixOffset=0。`);
+    }
+    if (desc.compaction === true && !isCompactionShader(desc.vsCode) && desc.compactionContract !== 'hpg-compaction-v1') {
+      throw new Error(`[hpg] 管线 "${desc.label ?? 'unnamed'}" 使用自定义 compaction shader 时必须声明 compactionContract: 'hpg-compaction-v1'.`);
+    }
+    if (desc.compaction !== true && isCompactionShader(desc.vsCode)) {
+      throw new Error(`[hpg] 内置 compaction 着色器必须搭配 compaction: true。`);
     }
 
     const instanceGroup = desc.compaction ? this.compactionLayout : this.instanceLayout;
@@ -325,21 +435,36 @@ export class Renderer {
         ? [userLayouts[0] as GPUBindGroupLayout, instanceGroup, ...userLayouts.slice(1)]
         : [instanceGroup],
     };
-    return this.cache.getOrCreate(this.device, full);
+    const resolved = this.cache.getOrCreate(this.device, full);
+    this.ownedPipelines.add(resolved);
+    return resolved;
   }
 
   createGeometry(
     vertexData: Float32Array,
     vertexLayouts: PipelineDesc['vertexLayouts'],
     indexData?: Uint16Array | Uint32Array,
-    indexFormat: GPUIndexFormat = 'uint16',
+    indexFormat?: GPUIndexFormat,
     primitive: GPUPrimitiveTopology = 'triangle-list',
   ) {
+    this.assertUsable('createGeometry');
     return this.arena.createGeometry(vertexData, vertexLayouts, indexData, indexFormat, primitive);
   }
 
+  private assertOwnedGeometry(geometry: Geometry): void {
+    if (!this.arena.ownsGeometry(geometry)) {
+      throw new Error('Geometry was not created by this Renderer or has been destroyed.');
+    }
+  }
+
+  private assertOwnedPipeline(item: RenderItem): void {
+    if (!this.ownedPipelines.has(item.pipeline) || (item.pipeline.device && item.pipeline.device !== this.device)) {
+      throw new Error(`Pipeline "${item.pipeline.label}" was not registered with this Renderer.`);
+    }
+  }
+
   private globalBindGroup(p: ResolvedPipeline): GPUBindGroup {
-    const hit = this.globalBGs.get(p.id);
+    const hit = this.globalBGs.get(p);
     if (hit) return hit;
     const bg = this.device.createBindGroup({
       label: `${this.label}:global:${p.label}`,
@@ -349,7 +474,7 @@ export class Renderer {
         resource: globalBindingResource(b),
       })),
     });
-    this.globalBGs.set(p.id, bg);
+    this.globalBGs.set(p, bg);
     return bg;
   }
 
@@ -360,6 +485,7 @@ export class Renderer {
    */
   submit(items: RenderItem[], opts?: SubmitOptions): RenderStats {
     this.assertUsable('submit');
+    this.assertPresentationFormat('submit');
     const n = items.length;
     const stats: RenderStats = {
       itemsSubmitted: n,
@@ -373,8 +499,19 @@ export class Renderer {
     if (n === 0) return stats;
 
     for (const item of items) {
-      validateRenderItem(item);
+       this.assertOwnedPipeline(item);
+       this.assertOwnedGeometry(item.geometry);
+       validateRenderItem(item);
+      assertDirectPipeline(item);
       assertRequiredBindGroup(item);
+    }
+
+    if (opts?.depthRange) {
+      const [near, far] = opts.depthRange;
+      if (!Number.isFinite(near) || !Number.isFinite(far) || far <= near) throw new Error('SubmitOptions.depthRange must be finite with far > near.');
+    }
+    if (opts?.camera && opts.camera.some((value) => !Number.isFinite(value))) {
+      throw new Error('SubmitOptions.camera values must be finite.');
     }
 
     // 1. 排序键 + 计数排序（稳定）。
@@ -405,7 +542,8 @@ export class Renderer {
     //    所有批都必须满足 dynamicOffset + 绑定尺寸 ≤ capacity（见 ensureInstanceBindGroup）。
     const maxBatchBytes = maxBatchBytesOf(batches);
     const base = this.ring.alloc(bytesToWrite + maxBatchBytes, RING_ALIGN);
-    this.ring.write(base, this.instanceStore, 0, bytesToWrite);
+    try {
+      this.ring.write(base, this.instanceStore, 0, bytesToWrite);
     // alloc() 可能触发 ring 扩容（底层换新 buffer）→ 必须在录制前重建实例 bind group。
     const instanceBindGroup = this.ensureInstanceBindGroup(maxBatchBytes);
 
@@ -434,24 +572,26 @@ export class Renderer {
     pipelines.clear();
     for (const b of batches) pipelines.add(b.pipeline.id);
 
-    this.executor.run(
-      pass,
-      {
-        batches,
-        items: sorted,
-        instanceBindGroup,
-        globalBindGroup: (p) => this.globalBindGroup(p),
-        frameBase: base,
-      },
-      stats,
-    );
-    stats.batches = batches.length;
-    stats.pipelinesUsed = pipelines.size;
-    pass.end();
+     this.executor.run(
+       pass,
+       {
+         batches,
+         items: sorted,
+         instanceBindGroup,
+         globalBindGroup: (p) => this.globalBindGroup(p),
+         frameBase: base,
+       },
+       stats,
+     );
+     stats.batches = batches.length;
+     stats.pipelinesUsed = pipelines.size;
+     pass.end();
 
-    this.device.queue.submit([encoder.finish()]);
-    this.ring.endFrame();
-    return stats;
+     this.device.queue.submit([encoder.finish()]);
+     return stats;
+   } finally {
+     this.ring.endFrame();
+   }
   }
 
   /**
@@ -465,6 +605,7 @@ export class Renderer {
    */
   submitDirect(items: RenderItem[], timestamps?: TimestampQuery): RenderStats {
     this.assertUsable('submitDirect');
+    this.assertPresentationFormat('submitDirect');
     const n = items.length;
     const stats: RenderStats = {
       itemsSubmitted: n,
@@ -478,7 +619,10 @@ export class Renderer {
     if (n === 0) return stats;
 
     for (const item of items) {
-      validateRenderItem(item);
+       this.assertOwnedPipeline(item);
+       this.assertOwnedGeometry(item.geometry);
+       validateRenderItem(item);
+      assertDirectPipeline(item);
       assertRequiredBindGroup(item);
     }
 
@@ -510,39 +654,40 @@ export class Renderer {
       // 实例记录布局：[0, mmBytes) 预留区 → mat4(64B) → 额外数据。
       const mmBytes = item.pipeline.modelMatrixOffset || 0;
       const mmFloat = mmBytes >> 2;
-      const extra = frameStride - mmBytes - 64;
-      const extraFloats = extra >> 2;
-      const cnt = instanceCountOf(item);
-      const m0 = item.transforms;
-      const extraData = item.instanceData;
-      const hasExtra = !!extraData && extraData.length >= cnt * extraFloats && extra >= 16;
-      let instanceOffset = alignedOffset;
-      for (let m = 0; m < cnt; m++) {
-        const base = instanceOffset / 4;
-        for (let c = 0; c < mmFloat; c++) this.instanceStore[base + c] = 0;
-        const f = base + mmFloat;
-        if (m0) {
-          const src = m * 16;
-          for (let c = 0; c < 16; c++) this.instanceStore[f + c] = m0[src + c] as number;
-        } else {
-          for (let c = 0; c < 16; c++) this.instanceStore[f + c] = 0;
-          this.instanceStore[f] = 1;
-          this.instanceStore[f + 5] = 1;
-          this.instanceStore[f + 10] = 1;
-          this.instanceStore[f + 15] = 1;
-        }
-        if (hasExtra && extraData) {
-          const src = m * extraFloats;
-          for (let c = 0; c < extraFloats; c++) this.instanceStore[f + 16 + c] = extraData[src + c] as number;
-        } else if (extra >= 16) {
-          this.instanceStore[f + 16] = 1;
-          this.instanceStore[f + 17] = 1;
-          this.instanceStore[f + 18] = 1;
-          this.instanceStore[f + 19] = 1;
-        }
-        instanceOffset += frameStride;
-      }
-      gpuOffset = instanceOffset;
+       const extra = frameStride - mmBytes - 64;
+       const extraFloats = extra >> 2;
+       const cnt = instanceCountOf(item);
+       const m0 = item.transforms;
+       const extraData = item.instanceData;
+       const hasExtra = extraData !== undefined;
+       let instanceOffset = alignedOffset;
+       for (let m = 0; m < cnt; m++) {
+         const base = instanceOffset / 4;
+         for (let c = 0; c < mmFloat; c++) this.instanceStore[base + c] = 0;
+         const f = base + mmFloat;
+         if (m0) {
+           const src = m * 16;
+           for (let c = 0; c < 16; c++) this.instanceStore[f + c] = m0[src + c] as number;
+         } else {
+           for (let c = 0; c < 16; c++) this.instanceStore[f + c] = 0;
+           this.instanceStore[f] = 1;
+           this.instanceStore[f + 5] = 1;
+           this.instanceStore[f + 10] = 1;
+           this.instanceStore[f + 15] = 1;
+         }
+           for (let c = 0; c < extraFloats; c++) this.instanceStore[f + 16 + c] = 0;
+           if (hasExtra && extraData) {
+             const src = m * extraFloats;
+             for (let c = 0; c < extraFloats; c++) this.instanceStore[f + 16 + c] = extraData[src + c] as number;
+           } else if (extra >= 16) {
+             this.instanceStore[f + 16] = 1;
+             this.instanceStore[f + 17] = 1;
+             this.instanceStore[f + 18] = 1;
+             this.instanceStore[f + 19] = 1;
+           }
+         instanceOffset += frameStride;
+       }
+       gpuOffset = instanceOffset;
     }
 
     const bytesToWrite = gpuOffset;
@@ -551,7 +696,8 @@ export class Renderer {
     // 每个 item 一个 draw call + 一个 dynamic offset，故预留「最大 item」的字节数
     // 作为实例 bind group 的绑定尺寸与 buffer 余量。
     const base = this.ring.alloc(bytesToWrite + maxItemBytes, RING_ALIGN);
-    this.ring.write(base, this.instanceStore, 0, bytesToWrite);
+    try {
+      this.ring.write(base, this.instanceStore, 0, bytesToWrite);
     const instanceBindGroup = this.ensureInstanceBindGroup(maxItemBytes);
 
     // 录制：逐 item 独立 draw call。
@@ -573,9 +719,10 @@ export class Renderer {
         depthLoadOp: 'clear',
         depthStoreOp: 'store',
       },
+      ...(timestamps ? { timestampWrites: timestamps.timestampWrites(0, 1) } : {}),
     });
 
-    if (timestamps) timestamps.writeTimestamp(pass, 0);
+
 
     const pipelines = this._pipelineSet;
     pipelines.clear();
@@ -602,12 +749,12 @@ export class Renderer {
       }
       for (let s = 0; s < geometry.vertexBuffers.length; s++) {
         const vb = geometry.vertexBuffers[s]!;
-        pass.setVertexBuffer(s, vb.buffer, vb.byteOffset);
+        pass.setVertexBuffer(s, vb.buffer, vb.byteOffset, vb.byteLength);
       }
 
       const cnt = instanceCountOf(item);
       if (geometry.indexSlice && geometry.indexBuffer) {
-        pass.setIndexBuffer(geometry.indexBuffer, geometry.indexFormat, geometry.indexSlice.byteOffset);
+        pass.setIndexBuffer(geometry.indexBuffer, geometry.indexFormat, geometry.indexSlice.byteOffset, geometry.indexSlice.byteLength);
         pass.drawIndexed(geometry.indexCount, cnt, 0, 0, 0);
       } else {
         pass.draw(geometry.vertexCount, cnt, 0, 0);
@@ -620,13 +767,15 @@ export class Renderer {
 
     stats.batches = n;
     stats.pipelinesUsed = pipelines.size;
-    if (timestamps) timestamps.writeTimestamp(pass, 1);
-    pass.end();
-    if (timestamps) timestamps.resolve(encoder);
 
-    this.device.queue.submit([encoder.finish()]);
-    this.ring.endFrame();
-    return stats;
+    pass.end();
+     if (timestamps) timestamps.resolve(encoder);
+
+     this.device.queue.submit([encoder.finish()]);
+     return stats;
+   } finally {
+     this.ring.endFrame();
+   }
   }
 
   /**
@@ -642,14 +791,15 @@ export class Renderer {
    *
    * 注意：传入的 item 必须使用 `registerPipeline({ compaction: true, vsCode: VS_INSTANCED_COMPACTION })`
    * 注册的管线 —— 顶点着色器需通过 `compactedIndices[instance_index]` 间接索引实例数据。
-   * 用普通管线调用会在 setBindGroup(1, ...) 处校验失败（group=1 布局不匹配）。
+   * 用普通管线调用会在提交前被显式拒绝（必须注册为 compaction pipeline）。
    *
    * @param vpMatrix 列主序 4×4 VP 矩阵（用于视锥裁剪面提取）
-   * @param timestamps 可选 GPU 时间戳查询；传入则在 compute + render pass 前后各写一次。
+   * @param timestamps 可选 GPU 时间戳查询；当前只覆盖 render pass，culling compute 不计入该区间。
    * @returns 该帧统计（`instances` 为候选实例数；可见数在 GPU 侧确定，不回读）
    */
   submitCulled(items: RenderItem[], vpMatrix: Float32Array, timestamps?: TimestampQuery): RenderStats {
     this.assertUsable('submitCulled');
+    this.assertPresentationFormat('submitCulled');
     const n = items.length;
     const stats: RenderStats = {
       itemsSubmitted: n,
@@ -662,15 +812,18 @@ export class Renderer {
 
     if (n === 0) return stats;
 
-    if (vpMatrix.length < 16) {
-      throw new Error('vpMatrix must contain at least 16 values.');
+    if (vpMatrix.length !== 16) {
+      throw new Error('vpMatrix must contain exactly 16 values.');
     }
     assertFiniteValues(vpMatrix, 'vpMatrix');
 
     for (const item of items) {
-      validateRenderItem(item);
+       this.assertOwnedPipeline(item);
+       this.assertOwnedGeometry(item.geometry);
+       validateRenderItem(item);
       assertRequiredBindGroup(item);
       assertCompactionPipeline(item);
+      assertAffineTransforms(item);
     }
 
     // 1. 按 (geometry, pipeline, bindGroup) 分组。
@@ -678,7 +831,7 @@ export class Renderer {
     //    用 pipeline 分组会把共享同一管线的多个 mesh 当成一个，只画其中一个。
     //    bindGroup（材质）也进分组键：一个 geometry 组只能绑定一个 group=2，
     //    不同材质的实例必须拆成各自的 draw（否则会串用同一张贴图）。
-    type GeoGroup = { geoIdx: number; item: RenderItem; count: number };
+     type GeoGroup = { geoIdx: number; item: RenderItem; count: number; itemCount: number };
     type ByBindGroup = Map<GPUBindGroup | undefined, GeoGroup>;
     const geoMap = new Map<Geometry, Map<ResolvedPipeline, ByBindGroup>>();
     const geoOrder: GeoGroup[] = [];
@@ -699,12 +852,13 @@ export class Renderer {
       let group = byBindGroup.get(item.bindGroup);
       const cnt = instanceCountOf(item);
       if (!group) {
-        group = { geoIdx: geoOrder.length, item, count: 0 };
+         group = { geoIdx: geoOrder.length, item, count: 0, itemCount: 0 };
         byBindGroup.set(item.bindGroup, group);
         geoOrder.push(group);
       }
-      group.count += cnt;
-      totalInstances += cnt;
+       group.count += cnt;
+       group.itemCount++;
+       totalInstances += cnt;
     }
 
     const geometryCount = geoOrder.length;
@@ -761,10 +915,9 @@ export class Renderer {
         ) continue;
         const cnt = instanceCountOf(item);
         const m0 = item.transforms;
-        const extraData = item.instanceData;
-        // 长度足够的额外数据才复制，避免instanceData 短于 instanceCount 时写入 NaN。
-        const hasExtra = !!extraData && extraData.length >= cnt * extraFloats && extra >= 16;
-        const b = item.bounding;
+         const extraData = item.instanceData;
+         const hasExtra = extraData !== undefined;
+         const b = item.bounding;
         for (let m = 0; m < cnt; m++) {
           const base = instanceOffset / 4;
           for (let c = 0; c < mmFloat; c++) this.instanceStore[base + c] = 0;
@@ -780,15 +933,16 @@ export class Renderer {
             this.instanceStore[f + 10] = 1;
             this.instanceStore[f + 15] = 1;
           }
-          if (hasExtra && extraData) {
-            const src = m * extraFloats;
-            for (let c = 0; c < extraFloats; c++) this.instanceStore[f + 16 + c] = extraData[src + c] as number;
-          } else if (extra >= 16) {
-            this.instanceStore[f + 16] = 1;
-            this.instanceStore[f + 17] = 1;
-            this.instanceStore[f + 18] = 1;
-            this.instanceStore[f + 19] = 1;
-          }
+           for (let c = 0; c < extraFloats; c++) this.instanceStore[f + 16 + c] = 0;
+           if (hasExtra && extraData) {
+             const src = m * extraFloats;
+             for (let c = 0; c < extraFloats; c++) this.instanceStore[f + 16 + c] = extraData[src + c] as number;
+           } else if (extra >= 16) {
+             this.instanceStore[f + 16] = 1;
+             this.instanceStore[f + 17] = 1;
+             this.instanceStore[f + 18] = 1;
+             this.instanceStore[f + 19] = 1;
+           }
 
           // 包围球：显式 bounding 优先；否则用局部 AABB × 实例矩阵（世界空间）。
           if (b) {
@@ -845,7 +999,8 @@ export class Renderer {
     this.ensureStore(bytesToWrite); // 冗余保险：容量已在填充前确保。
     const maxBatchBytes = maxGroupBytesOf(geoOrder);
     const base = this.ring.alloc(bytesToWrite + maxBatchBytes, RING_ALIGN);
-    this.ring.write(base, this.instanceStore, 0, bytesToWrite);
+    try {
+      this.ring.write(base, this.instanceStore, 0, bytesToWrite);
 
     // 6. GPU 视锥剔除：compute shader 原子填充 instanceCount + compaction mapping。
     //
@@ -857,24 +1012,27 @@ export class Renderer {
     for (const info of batchInfos) {
       const item = geoOrder[info.geoIdx]!.item;
       const geo = item.geometry;
-      const base32 = info.geoIdx * 5;
-      argsU32[base32 + 0] = geo.indexCount || geo.vertexCount; // indexCount
+       const base32 = info.geoIdx * 5;
+       argsU32[base32 + 0] = geo.indexSlice ? geo.indexCount : geo.vertexCount;
       // [base32 + 1] instanceCount 由 compute shader 原子填充
       argsU32[base32 + 2] = 0; // firstIndex
       argsU32[base32 + 3] = 0; // baseVertex
       argsU32[base32 + 4] = 0; // firstInstance
     }
 
-    if (!this._culling) this._culling = new CullingPipeline(this.device);
+     if (!this._culling) this._culling = new CullingPipeline(this.device);
+    const encoder = this.device.createCommandEncoder({ label: `${this.label}:frame-culled` });
     const { drawArgsBuffer, compactedIndicesBuffer, slotBases, maxSlotBytes } = this._culling.cull(
       vpMatrix,
       spheresData,
       geometryIds,
       geometryCount,
-      argsU32,
-      // 不传 timestamps：compute pass 与 render pass 共用同一个 query set，
-      // 两边都写会互相覆盖（详见 TimestampQuery 的槽位约定）。
-    );
+       argsU32,
+       // 不传 timestamps：compute pass 与 render pass 共用同一个 query set，
+       // 两边都写会互相覆盖（详见 TimestampQuery 的槽位约定）。
+       undefined,
+       encoder,
+     );
 
     // 8. compaction bind group：[instanceBuffer + compactedIndicesBuffer]（按 buffer 身份与尺寸缓存复用）。
     const compactionBindGroup = this.ensureCompactionBindGroup(
@@ -884,7 +1042,6 @@ export class Renderer {
     );
 
     // 9. 录制 render pass + indirect draw。
-    const encoder = this.device.createCommandEncoder({ label: `${this.label}:frame-culled` });
     const view = this.context.getCurrentTexture().createView();
     const pass = encoder.beginRenderPass({
       label: `${this.label}:main-culled`,
@@ -902,9 +1059,10 @@ export class Renderer {
         depthLoadOp: 'clear',
         depthStoreOp: 'store',
       },
+      ...(timestamps ? { timestampWrites: timestamps.timestampWrites(0, 1) } : {}),
     });
 
-    if (timestamps) timestamps.writeTimestamp(pass, 0);
+
 
     const pipelines = this._pipelineSet;
     pipelines.clear();
@@ -943,30 +1101,32 @@ export class Renderer {
 
       for (let s = 0; s < geometry.vertexBuffers.length; s++) {
         const vb = geometry.vertexBuffers[s]!;
-        pass.setVertexBuffer(s, vb.buffer, vb.byteOffset);
+        pass.setVertexBuffer(s, vb.buffer, vb.byteOffset, vb.byteLength);
       }
       if (geometry.indexSlice && geometry.indexBuffer) {
-        pass.setIndexBuffer(geometry.indexBuffer, geometry.indexFormat, geometry.indexSlice.byteOffset);
+        pass.setIndexBuffer(geometry.indexBuffer, geometry.indexFormat, geometry.indexSlice.byteOffset, geometry.indexSlice.byteLength);
         pass.drawIndexedIndirect(drawArgsBuffer, info.geoIdx * 20);
       } else {
         pass.drawIndirect(drawArgsBuffer, info.geoIdx * 20);
       }
 
-      stats.drawCalls++;
-      stats.itemsDrawn++;
+       stats.drawCalls++;
+       stats.itemsDrawn += (geoOrder[info.geoIdx] as GeoGroup).itemCount;
     }
 
     stats.instances = totalInstances;
     stats.batches = geometryCount;
     stats.pipelinesUsed = pipelines.size;
-    if (timestamps) timestamps.writeTimestamp(pass, 1);
+
     pass.end();
     if (timestamps) timestamps.resolve(encoder);
 
-    this.device.queue.submit([encoder.finish()]);
-    this.ring.endFrame();
-    return stats;
-  }
+      this.device.queue.submit([encoder.finish()]);
+      return stats;
+    } finally {
+       this.ring.endFrame();
+     }
+   }
 
   private assemble(batches: Batch[], totalBytes: number): void {
     this.ensureStore(totalBytes);
@@ -985,10 +1145,9 @@ export class Renderer {
         const item = this.sortedItems[k] as RenderItem;
         const cnt = instanceCountOf(item);
         const m0 = item.transforms;
-        const extraData = item.instanceData;
-        // 长度不足时整体回退到默认颜色：避免越界读到 undefined → NaN 写进实例缓冲。
-        const hasExtra = !!extraData && extraData.length >= cnt * extraFloats && extra >= 16;
-        for (let m = 0; m < cnt; m++) {
+         const extraData = item.instanceData;
+         const hasExtra = extraData !== undefined;
+         for (let m = 0; m < cnt; m++) {
           const base = write / 4;
           // 预留区显式清零：同一条 ring 区间会跨帧复用，不清会残留上一帧数据。
           for (let c = 0; c < mmFloat; c++) this.instanceStore[base + c] = 0;
@@ -1004,16 +1163,16 @@ export class Renderer {
             this.instanceStore[f + 10] = 1;
             this.instanceStore[f + 15] = 1;
           }
-          if (hasExtra && extraData) {
-            const src = m * extraFloats;
-            for (let c = 0; c < extraFloats; c++) this.instanceStore[f + 16 + c] = extraData[src + c] as number;
-          } else if (extra >= 16) {
-            // 默认颜色：白。
-            this.instanceStore[f + 16] = 1;
-            this.instanceStore[f + 17] = 1;
-            this.instanceStore[f + 18] = 1;
-            this.instanceStore[f + 19] = 1;
-          }
+           for (let c = 0; c < extraFloats; c++) this.instanceStore[f + 16 + c] = 0;
+           if (hasExtra && extraData) {
+             const src = m * extraFloats;
+             for (let c = 0; c < extraFloats; c++) this.instanceStore[f + 16 + c] = extraData[src + c] as number;
+           } else if (extra >= 16) {
+             this.instanceStore[f + 16] = 1;
+             this.instanceStore[f + 17] = 1;
+             this.instanceStore[f + 18] = 1;
+             this.instanceStore[f + 19] = 1;
+           }
           write += frameStride;
         }
       }
@@ -1021,8 +1180,8 @@ export class Renderer {
   }
 
   private ensureScratch(n: number): void {
-    if (this.sortedItems.length >= n) return;
     this.sortedItems.length = n;
+    if (this.orderScratch.length >= n) return;
     this.orderScratch = new Int32Array(n);
     this.keysScratch = new Array(n);
     this.indexScratch = new Array(n);
@@ -1069,10 +1228,11 @@ export class Renderer {
     this._culling?.dispose();
     this.arena.dispose();
     this.ring.dispose();
-    this.compactionBG = null;
-    this.instanceBG = null;
-    this.globalBGs.clear();
-  }
+     this.compactionBG = null;
+     this.instanceBG = null;
+     this.globalBGs.clear();
+     this.cache.clear();
+   }
 }
 
 /** 夹到 [0, 1]。 */
@@ -1184,6 +1344,7 @@ export function createGlobalBindGroup(
   layout: GPUBindGroupLayout,
   bindings: GlobalBinding[],
 ): GPUBindGroup {
+  assertGlobalBindings(device, bindings);
   return device.createBindGroup({
     layout,
     entries: bindings.map((b) => ({ binding: b.binding, resource: globalBindingResource(b) })),
@@ -1196,6 +1357,29 @@ export function createGlobalBindGroup(
  * `byteOffset` / `byteLength` 必须真正生效：只绑整块 buffer 会让「同一 buffer 内的多个
  * uniform 切片」（如 uniform 数组）静默读到错误数据。
  */
+function assertGlobalBindings(device: GPUDevice, bindings: GlobalBinding[]): void {
+  const seen = new Set<number>();
+  for (const binding of bindings) {
+    if (!Number.isSafeInteger(binding.binding) || binding.binding < 0 || seen.has(binding.binding)) {
+      throw new Error('GlobalBinding.binding must be a unique non-negative integer.');
+    }
+    seen.add(binding.binding);
+    const offset = binding.byteOffset ?? 0;
+    const size = binding.byteLength ?? binding.buffer.size - offset;
+    const alignment = device.limits?.minUniformBufferOffsetAlignment ?? 256;
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset % alignment !== 0) {
+      throw new Error(`GlobalBinding byteOffset ${offset} must be aligned to ${alignment}.`);
+    }
+    if (!Number.isSafeInteger(size) || size <= 0 || size % 4 !== 0 || offset + size > binding.buffer.size) {
+      throw new Error('GlobalBinding byteOffset and byteLength must be 4-byte aligned and within buffer bounds.');
+    }
+    const usage = binding.buffer.usage;
+    if ((usage & GPUBufferUsage.UNIFORM) === 0) {
+      throw new Error('GlobalBinding requires a buffer with UNIFORM usage.');
+    }
+  }
+}
+
 function globalBindingResource(b: GlobalBinding): GPUBufferBinding | GPUBuffer {
   if (b.byteOffset === undefined && b.byteLength === undefined) return b.buffer;
   const resource: GPUBufferBinding = { buffer: b.buffer };

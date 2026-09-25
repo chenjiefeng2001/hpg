@@ -7,7 +7,7 @@ import type { ResolvedPipeline } from '../types';
 
 /** 对齐到 256 字节的实例起始偏移（满足 minStorageBufferOffsetAlignment）。 */
 export function instanceBufferOffset(rawOffset: number): number {
-  return (rawOffset + 255) & ~255;
+  return Math.ceil(rawOffset / 256) * 256;
 }
 
 export interface Batch {

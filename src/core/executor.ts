@@ -89,13 +89,13 @@ export class ExecutionBackend {
       if (geometry !== lastGeometry) {
         const vbs = geometry.vertexBuffers;
         for (let s = 0; s < vbs.length; s++) {
-          const vb = vbs[s]!;
-          pass.setVertexBuffer(s, vb.buffer, vb.byteOffset);
+         const vb = vbs[s]!;
+         pass.setVertexBuffer(s, vb.buffer, vb.byteOffset, vb.byteLength);
         }
       }
 
       if (geometry.indexSlice && geometry.indexBuffer) {
-        pass.setIndexBuffer(geometry.indexBuffer, geometry.indexFormat, geometry.indexSlice.byteOffset);
+        pass.setIndexBuffer(geometry.indexBuffer, geometry.indexFormat, geometry.indexSlice.byteOffset, geometry.indexSlice.byteLength);
         pass.drawIndexed(geometry.indexCount, batch.instanceCount, 0, 0, 0);
       } else {
         pass.draw(geometry.vertexCount, batch.instanceCount, 0, 0);
@@ -114,7 +114,6 @@ export class ExecutionBackend {
    *
    * @param indirectBuffer 包含 N 个 DrawIndexedIndirectArgs 的 GPUBuffer
    * @param indirectOffsetBytes indirectBuffer 的起始偏移（字节）
-   * @param countBuffer 可选：包含实际绘制数量的 GPUBuffer（用于 GPU 裁剪后的可变数量绘制）
    */
   runIndirect(
     pass: GPURenderPassEncoder,
@@ -122,7 +121,6 @@ export class ExecutionBackend {
     stats: ExecutorStats,
     indirectBuffer: GPUBuffer,
     indirectOffsetBytes = 0,
-    countBuffer?: GPUBuffer,
   ): void {
     let lastPipeline: ResolvedPipeline | null = null;
     let lastGeometry: RenderItem['geometry'] | null = null;
@@ -155,13 +153,13 @@ export class ExecutionBackend {
       if (geometry !== lastGeometry) {
         const vbs = geometry.vertexBuffers;
         for (let s = 0; s < vbs.length; s++) {
-          const vb = vbs[s]!;
-          pass.setVertexBuffer(s, vb.buffer, vb.byteOffset);
+         const vb = vbs[s]!;
+         pass.setVertexBuffer(s, vb.buffer, vb.byteOffset, vb.byteLength);
         }
       }
 
       if (geometry.indexSlice && geometry.indexBuffer) {
-        pass.setIndexBuffer(geometry.indexBuffer, geometry.indexFormat, geometry.indexSlice.byteOffset);
+        pass.setIndexBuffer(geometry.indexBuffer, geometry.indexFormat, geometry.indexSlice.byteOffset, geometry.indexSlice.byteLength);
         const argsOffset = indirectOffsetBytes + i * 20; // 20 bytes per DrawIndexedIndirectArgs
         pass.drawIndexedIndirect(indirectBuffer, argsOffset);
       } else {

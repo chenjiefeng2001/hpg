@@ -34,9 +34,20 @@ describe('GeometryArena', () => {
     expect(geo.primitive).toBe('triangle-list');
   });
 
+  it('非 float32x3 position 不推导错误的 AABB', () => {
+    const arena = new GeometryArena(fakeDevice());
+    const layout: VertexLayoutDesc[] = [{
+      arrayStride: 8,
+      stepMode: 'vertex',
+      attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' as GPUVertexFormat }],
+    }];
+    const geometry = arena.createGeometry(new Float32Array([0, 0, 1, 0, 0, 1]), layout);
+    expect(geometry.bounds).toBeUndefined();
+  });
+
   it('createGeometry with index data returns indexed geometry', () => {
     const arena = new GeometryArena(fakeDevice());
-    const verts = new Float32Array(16);
+    const verts = new Float32Array(24);
     const indices = new Uint16Array([0, 1, 2]);
     const geo = arena.createGeometry(verts, LAYOUT, indices);
     expect(geo.indexBuffer).toBeDefined();
@@ -45,6 +56,21 @@ describe('GeometryArena', () => {
     expect(geo.indexSlice!.byteLength).toBeGreaterThanOrEqual(indices.byteLength);
     // writeBuffer requires 4-byte alignment, so index slice may be padded
     expect(geo.indexSlice!.byteLength % 4).toBe(0);
+  });
+
+  it('回收非 16 对齐的 vertex payload 时保留 allocation padding', () => {
+    const arena = new GeometryArena(fakeDevice());
+    const layout: VertexLayoutDesc[] = [{
+      arrayStride: 24,
+      stepMode: 'vertex',
+      attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' as GPUVertexFormat }],
+    }];
+     const vertices = new Float32Array(18);
+     const first = arena.createGeometry(vertices, layout);
+    const offset = first.vertexSlice.byteOffset;
+    arena.destroyGeometry(first);
+    const second = arena.createGeometry(vertices, layout);
+    expect(second.vertexSlice.byteOffset).toBe(offset);
   });
 
   it('destroyGeometry reclaims vertex slice for reuse', () => {
@@ -74,10 +100,11 @@ describe('GeometryArena', () => {
 
     // 索引侧同理。
     const idx = new Uint16Array([0, 1, 2]);
-    const a0 = arena.createGeometry(verts, LAYOUT, idx);
+    const indexVerts = new Float32Array(24);
+    const a0 = arena.createGeometry(indexVerts, LAYOUT, idx);
     const iOffset0 = a0.indexSlice!.byteOffset;
     arena.destroyGeometry(a0);
-    const a1 = arena.createGeometry(verts, LAYOUT, idx);
+    const a1 = arena.createGeometry(indexVerts, LAYOUT, idx);
     expect(a1.indexSlice!.byteOffset).toBe(iOffset0);
     expect(a1.indexSlice!.byteOffset).toBeGreaterThanOrEqual(0);
   });
@@ -136,7 +163,7 @@ describe('GeometryArena', () => {
 
   it('destroyGeometry reclaims index slice for reuse', () => {
     const arena = new GeometryArena(fakeDevice());
-    const verts = new Float32Array(16);
+    const verts = new Float32Array(24);
     const indices = new Uint16Array([0, 1, 2]);
     const geo = arena.createGeometry(verts, LAYOUT, indices);
     const iBuf = geo.indexBuffer!;
@@ -161,7 +188,7 @@ describe('GeometryArena', () => {
 
   it('pool grows when index capacity exhausted', () => {
     const arena = new GeometryArena(fakeDevice());
-    const verts = new Float32Array(16);
+    const verts = new Float32Array(24);
     const indices = new Uint16Array([0, 1, 2]);
     const firstGeo = arena.createGeometry(verts, LAYOUT, indices);
     const firstIdxBuf = firstGeo.indexBuffer;
@@ -172,13 +199,28 @@ describe('GeometryArena', () => {
     expect(bigGeo.indexBuffer).not.toBe(firstIdxBuf);
   });
 
+  it('Uint32 index format is inferred and mismatches are rejected', () => {
+    const arena = new GeometryArena(fakeDevice());
+    const verts = new Float32Array(24);
+    const geo = arena.createGeometry(verts, LAYOUT, new Uint32Array([0, 1, 2]));
+    expect(geo.indexFormat).toBe('uint32');
+    expect(() => arena.createGeometry(verts, LAYOUT, new Uint32Array([0, 1, 2]), 'uint16')).toThrow(/does not match/);
+    expect(() => arena.createGeometry(verts, LAYOUT, new Uint16Array([0, 1, 3]))).toThrow(/exceeds vertexCount/);
+  });
+
+  it('rejects unsupported multi-slot or instance-step layouts', () => {
+    const arena = new GeometryArena(fakeDevice());
+    const verts = new Float32Array(24);
+    const second = { ...LAYOUT[0]! };
+    expect(() => arena.createGeometry(verts, [LAYOUT[0]!, second])).toThrow(/exactly one/);
+    expect(() => arena.createGeometry(verts, [{ ...LAYOUT[0]!, stepMode: 'instance' as const }])).toThrow(/vertex-step/);
+  });
+
   it('dispose destroys all pools', () => {
     const arena = new GeometryArena(fakeDevice());
     arena.createGeometry(new Float32Array(16), LAYOUT);
     arena.dispose();
-    // No crash; subsequent createGeometry should allocate fresh pools.
-    const geo = arena.createGeometry(new Float32Array(16), LAYOUT);
-    expect(geo.vertexBuffer).toBeDefined();
+    expect(() => arena.createGeometry(new Float32Array(16), LAYOUT)).toThrow(/dispose/);
   });
 
   it('destroyGeometry is no-op for unknown geometry', () => {

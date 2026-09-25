@@ -6,7 +6,7 @@ const MOCK_BGL = { label: 'mock-bgl' } as unknown as GPUBindGroupLayout;
 
 function fakeDevice(): GPUDevice {
   return {
-    createBuffer: () => ({}) as GPUBuffer,
+    createBuffer: () => ({ size: 64 } as GPUBuffer),
     createBindGroupLayout: () => MOCK_BGL,
     createPipelineLayout: () => ({}) as GPUPipelineLayout,
     createShaderModule: () => ({}) as GPUShaderModule,
@@ -59,6 +59,18 @@ describe('PipelineCache', () => {
     expect(cache.size).toBe(2);
   });
 
+  it('separates buffer identity and layout identity in the cache key', () => {
+    const cache = new PipelineCache();
+    const device = fakeDevice();
+    const layout = { label: 'same' } as unknown as GPUBindGroupLayout;
+    const buffer = { size: 64 } as GPUBuffer;
+    const a = cache.getOrCreate(device, makeResourceDesc(layout, buffer));
+    const b = cache.getOrCreate(device, makeResourceDesc(layout, { size: 64 } as GPUBuffer));
+    const c = cache.getOrCreate(device, makeResourceDesc({ label: 'same' } as unknown as GPUBindGroupLayout, buffer));
+    expect(a).not.toBe(b);
+    expect(a).not.toBe(c);
+  });
+
   it('does not reuse pipelines for different GPU resource identities', () => {
     const cache = new PipelineCache();
     const device = fakeDevice();
@@ -72,6 +84,38 @@ describe('PipelineCache', () => {
 
     expect(p1).not.toBe(p2);
     expect(cache.size).toBe(2);
+  });
+
+  it('does not reuse a pipeline across devices', () => {
+    const cache = new PipelineCache();
+    const first = fakeDevice();
+    const second = fakeDevice();
+    cache.getOrCreate(first, makeDesc());
+    expect(() => cache.getOrCreate(second, makeDesc())).toThrow(/across GPU devices/);
+  });
+
+  it('stores a descriptor snapshot instead of the caller mutable object', () => {
+    const cache = new PipelineCache();
+    const device = fakeDevice();
+    const buffer = { size: 64 } as GPUBuffer;
+    const desc = makeResourceDesc(MOCK_BGL, buffer);
+    const pipeline = cache.getOrCreate(device, desc);
+    desc.globalBindings[0]!.buffer = { size: 64 } as GPUBuffer;
+    desc.globalBindings[0]!.byteOffset = 32;
+    expect(pipeline.desc.globalBindings[0]!.buffer).toBe(buffer);
+    expect(pipeline.desc.globalBindings[0]!.byteOffset).toBeUndefined();
+    expect(() => { pipeline.desc.globalBindings[0]!.buffer = { size: 64 } as GPUBuffer; }).toThrow();
+    expect(() => { pipeline.bytesPerInstance = 64; }).toThrow();
+  });
+
+  it('clear removes cached pipelines and releases the device binding', () => {
+    const cache = new PipelineCache();
+    const device = fakeDevice();
+    cache.getOrCreate(device, makeDesc());
+    expect(cache.size).toBe(1);
+    cache.clear();
+    expect(cache.size).toBe(0);
+    expect(() => cache.getOrCreate(fakeDevice(), makeDesc())).not.toThrow();
   });
 
   it('onStats reports created=true for miss and created=false for hit', () => {

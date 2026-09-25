@@ -18,7 +18,7 @@ import { lookAt, perspective, multiply, invert } from '../src/core/math';
 import { VS_INSTANCED, VS_INSTANCED_COMPACTION, FS_COLOR } from '../src/shaders/instance';
 import { createFakeGPU } from './fake-gpu';
 import type { GltfAsset } from '../src/core/gltf';
-import type { RenderItem } from '../src/types';
+import type { RenderItem, VertexLayoutDesc } from '../src/types';
 
 const FORMAT: GPUTextureFormat = 'bgra8unorm';
 
@@ -56,9 +56,23 @@ function makeRenderer() {
   return { device, context, recorded, renderer };
 }
 
+function customInstanceLayoutShader(base: string): string {
+  const marker = `struct InstanceData {
+    modelMatrix: mat4x4<f32>,
+    color: vec4<f32>,
+};`;
+  const replacement = `struct InstanceData {
+    modelMatrix: mat4x4<f32>,
+    color: vec4<f32>,
+    padding: vec4<f32>,
+};`;
+  if (!base.includes(marker)) throw new Error('test shader does not contain InstanceData');
+  return base.replace(marker, replacement);
+}
+
 function registerPipeline(
   renderer: Renderer,
-  opts: { compaction?: boolean; label?: string; bytesPerInstance?: number } = {},
+  opts: { compaction?: boolean; label?: string; bytesPerInstance?: number; vertexLayouts?: VertexLayoutDesc[] } = {},
 ) {
   const layout = uniformBindGroupLayout(renderer.device, [
     { binding: 0, visibility: GPUShaderStage.VERTEX },
@@ -67,17 +81,24 @@ function registerPipeline(
     size: 64,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
+  const baseShader = opts.compaction ? VS_INSTANCED_COMPACTION : VS_INSTANCED;
+  const vsCode = opts.bytesPerInstance !== undefined && opts.bytesPerInstance !== 80
+    ? customInstanceLayoutShader(baseShader)
+    : baseShader;
   return renderer.registerPipeline({
     label: opts.label ?? 'chain',
-    vsCode: opts.compaction ? VS_INSTANCED_COMPACTION : VS_INSTANCED,
+    vsCode,
     fsCode: FS_COLOR,
-    vertexLayouts: LAYOUT,
+    vertexLayouts: opts.vertexLayouts ?? LAYOUT,
     bindGroupLayouts: [layout],
     globalBindings: [{ binding: 0, buffer: uniform }],
     depth: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
     targets: [{ format: FORMAT }],
-    compaction: opts.compaction,
-    bytesPerInstance: opts.bytesPerInstance,
+     compaction: opts.compaction,
+     compactionContract: opts.compaction && opts.bytesPerInstance !== undefined && opts.bytesPerInstance !== 80
+       ? 'hpg-compaction-v1'
+       : undefined,
+     bytesPerInstance: opts.bytesPerInstance,
   });
 }
 
@@ -151,6 +172,19 @@ describe('glTF 导入链路', () => {
     renderer.dispose();
   });
 
+  it('缺失 NORMAL 时按三角形展开并计算 flat normals', () => {
+    const { renderer, recorded } = makeRenderer();
+    const scene = importGltfAsset(scaledAsset(), renderer);
+    const write = recorded.writes.find((w) => w.bytes.byteLength === 6 * 48);
+    expect(write).toBeDefined();
+    const floats = new Float32Array(write!.bytes.buffer, write!.bytes.byteOffset, 6 * 12);
+    for (let i = 0; i < 6; i++) {
+      const normal = Array.from(floats.slice(i * 12 + 3, i * 12 + 6));
+      expect(Math.hypot(...normal)).toBeCloseTo(1, 5);
+    }
+    renderer.dispose();
+  });
+
   it('importGltfAsset 的 scale 选项同样进入包围盒', () => {
     const { renderer } = makeRenderer();
     const scene = importGltfAsset(scaledAsset(), renderer, { scale: 0.5 });
@@ -182,7 +216,6 @@ describe('glTF 导入链路', () => {
 
   it('同一 mesh 被多个节点引用时复用几何体，并被 Batcher 合并为一个 draw', () => {
     const { renderer, recorded } = makeRenderer();
-    const pipeline = registerPipeline(renderer);
 
     const asset = scaledAsset();
     // 再加一个引用同一 mesh 的节点（Blender linked duplicate / instancing）
@@ -195,6 +228,7 @@ describe('glTF 导入链路', () => {
     });
 
     const scene = importGltfAsset(asset, renderer);
+    const pipeline = registerPipeline(renderer, { vertexLayouts: scene.meshes[0]!.geometry.vertexLayouts });
     expect(scene.meshes.length).toBe(2);
     // 关键：两个节点共享同一 Geometry 引用（否则永远无法合批）
     expect(scene.meshes[0]!.geometry).toBe(scene.meshes[1]!.geometry);
@@ -399,6 +433,44 @@ describe('submitCulled 分组与 draw args', () => {
     renderer.dispose();
   });
 
+  it('culling stats counts all source items in a merged geometry group', () => {
+    const { renderer } = makeRenderer();
+    const pipeline = registerPipeline(renderer, { compaction: true });
+    const geometry = cubeGeometry(renderer.geometryArena);
+    const vp = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const stats = renderer.submitCulled([{ geometry, pipeline }, { geometry, pipeline }], vp);
+    expect(stats.drawCalls).toBe(1);
+    expect(stats.itemsDrawn).toBe(2);
+    renderer.dispose();
+  });
+
+  it('空索引几何保持 indexed indirect 语义，不用 vertexCount 回退', () => {
+    const { renderer, recorded } = makeRenderer();
+    const pipeline = registerPipeline(renderer, { compaction: true });
+    const geometry = renderer.createGeometry(
+      new Float32Array(9),
+      LAYOUT,
+      new Uint16Array(0),
+    );
+    const vp = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    renderer.submitCulled([{ geometry, pipeline }], vp);
+    expect(recorded.indirectDraws).toHaveLength(1);
+    expect(recorded.indirectDraws[0]!.indexed).toBe(true);
+    const write = recorded.writes.filter((w) => w.bytes.byteLength === 20).at(-1)!;
+    expect(new Uint32Array(write.bytes.buffer, write.bytes.byteOffset, 5)[0]).toBe(0);
+    renderer.dispose();
+  });
+
+  it('culling compute 与 render 使用同一个 command submit', () => {
+    const { renderer, recorded } = makeRenderer();
+    const pipeline = registerPipeline(renderer, { compaction: true });
+    const geometry = cubeGeometry(renderer.geometryArena);
+    const vp = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    renderer.submitCulled([{ geometry, pipeline }], vp);
+    expect(recorded.submits).toBe(1);
+    renderer.dispose();
+  });
+
   it('compaction binding 逐 geometry 重绑两个 dynamic offset（实例区 + slot 区）', () => {
     const { renderer, recorded } = makeRenderer();
     const pipeline = registerPipeline(renderer, { compaction: true });
@@ -550,6 +622,31 @@ describe('submitCulled 分组与 draw args', () => {
     renderer.dispose();
   });
 
+  it('submitCulled 拒绝 projective transform', () => {
+    const { renderer } = makeRenderer();
+    const pipeline = registerPipeline(renderer, { compaction: true });
+    const geometry = cubeGeometry(renderer.geometryArena);
+    const projective = new Float32Array([
+      -10, 0, 0, 11,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 0,
+    ]);
+    const vp = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    expect(() => renderer.submitCulled([{ geometry, pipeline, transforms: projective }], vp)).toThrow(/affine/);
+    renderer.dispose();
+  });
+
+  it('vertex/index binding 使用几何切片长度', () => {
+    const { renderer, recorded } = makeRenderer();
+    const pipeline = registerPipeline(renderer);
+    const geometry = cubeGeometry(renderer.geometryArena);
+    renderer.submit([{ geometry, pipeline }]);
+    expect(recorded.vertexBufferBinds.at(-1)?.size).toBe(geometry.vertexSlice.byteLength);
+    expect(recorded.indexBufferBindsDetail.at(-1)?.size).toBe(geometry.indexSlice?.byteLength);
+    renderer.dispose();
+  });
+
   it('compaction 管线使用独立的 group=1 布局（与直接绘制管线区分）', () => {
     const { renderer } = makeRenderer();
     const direct = registerPipeline(renderer, { label: 'direct' });
@@ -698,6 +795,25 @@ describe('帧内混合实例跨步（bytesPerInstance）', () => {
     expect(f[64 + 12]).toBe(99);
 
     renderer.dispose();
+  });
+
+  it('三路入口在省略 instanceData 时清零额外字段而非保留上一帧', () => {
+    const vp = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    for (const mode of ['submit', 'direct', 'culled'] as const) {
+      const { renderer, recorded } = makeRenderer();
+      const pipeline = registerPipeline(renderer, { compaction: mode === 'culled', bytesPerInstance: 96 });
+      const geometry = cubeGeometry(renderer.geometryArena);
+      if (mode === 'culled') renderer.submitCulled([{ geometry, pipeline, instanceData: new Float32Array(8).fill(7) }], vp);
+      else if (mode === 'direct') renderer.submitDirect([{ geometry, pipeline, instanceData: new Float32Array(8).fill(7) }]);
+      else renderer.submit([{ geometry, pipeline, instanceData: new Float32Array(8).fill(7) }]);
+      if (mode === 'submit') renderer.submit([{ geometry, pipeline }]);
+      else if (mode === 'direct') renderer.submitDirect([{ geometry, pipeline }]);
+      else renderer.submitCulled([{ geometry, pipeline }], vp);
+      const f = instanceWrite(renderer, recorded);
+      expect(Array.from(f.slice(16, 20))).toEqual([1, 1, 1, 1]);
+      expect(Array.from(f.slice(20, 24))).toEqual([0, 0, 0, 0]);
+      renderer.dispose();
+    }
   });
 
   it('submitDirect 同样按各自管线跨步落位', () => {

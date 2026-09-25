@@ -73,8 +73,17 @@ export class GeometryArena {
   private _geoMeta = new WeakMap<Geometry, GeometryMeta>();
   private _geoCount = 0;
   private _poolSeq = 0;
+  private _disposed = false;
 
   constructor(private device: GPUDevice) {}
+
+  private assertUsable(method: string): void {
+    if (this._disposed) throw new Error(`GeometryArena 已 dispose，${method}() 不可再用。`);
+  }
+
+  ownsGeometry(geometry: Geometry): boolean {
+    return !this._disposed && this._geoMeta.has(geometry);
+  }
 
   /** 当前活跃的 vertex 池（最后一个）。 */
   private get _vertex(): ArenaBuffers | null {
@@ -87,6 +96,7 @@ export class GeometryArena {
   }
 
   get vertexBuffer(): GPUBuffer {
+    this.assertUsable('vertexBuffer');
     return (this._vertex ?? this.createVertexPool()).buffer;
   }
 
@@ -106,9 +116,12 @@ export class GeometryArena {
     vertexData: Float32Array,
     vertexLayouts: VertexLayoutDesc[],
     indexData?: Uint16Array | Uint32Array,
-    indexFormat: GPUIndexFormat = 'uint16',
+    indexFormat?: GPUIndexFormat,
     primitive: GPUPrimitiveTopology = 'triangle-list',
   ): Geometry {
+    this.assertUsable('createGeometry');
+    validateGeometryInputs(vertexData, vertexLayouts, indexData, indexFormat, primitive);
+    const resolvedIndexFormat = indexData ? indexFormat ?? (indexData instanceof Uint32Array ? 'uint32' : 'uint16') : indexFormat ?? 'uint16';
     const vBytes = vertexData.byteLength;
     // 复用 free-list 时目标池是**该空闲块所在的池**（可能是旧池）；
     // 只有全新分配才落在最新池。写回错误的池会覆盖该池中存活几何体的数据。
@@ -127,17 +140,17 @@ export class GeometryArena {
       vertexSlice: vSlice,
       vertexBuffers: [vSlice],
       vertexLayouts,
-      indexFormat,
+      indexFormat: resolvedIndexFormat,
       indexCount: vertexCount,
       vertexCount,
       primitive,
       bounds: computePositionBounds(vertexData, vertexLayouts, vertexCount),
     };
 
-    const meta: GeometryMeta = {
-      vertex: vAlloc,
-      vertexByteLength: vBytes,
-    };
+     const meta: GeometryMeta = {
+       vertex: vAlloc,
+       vertexByteLength: align16(vBytes),
+     };
 
     if (indexData) {
       let iBytes = indexData.byteLength;
@@ -301,6 +314,8 @@ export class GeometryArena {
 
   /** 销毁所有池，释放 GPU 内存。调用后不应再使用任何该 Arena 创建的 Geometry。 */
   dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
     for (const p of this._vertexPools) p.buffer.destroy();
     for (const p of this._indexPools) p.buffer.destroy();
     this._vertexPools.length = 0;
@@ -309,7 +324,109 @@ export class GeometryArena {
     this._indexCursor = 0;
     this._vertexFrees.length = 0;
     this._indexFrees.length = 0;
+    this._geoMeta = new WeakMap();
     this._geoCount = 0;
+  }
+}
+
+function validateGeometryInputs(
+  vertexData: Float32Array,
+  vertexLayouts: VertexLayoutDesc[],
+  indexData: Uint16Array | Uint32Array | undefined,
+  indexFormat: GPUIndexFormat | undefined,
+  primitive: GPUPrimitiveTopology,
+): void {
+  if (!(vertexData instanceof Float32Array)) throw new Error('vertexData must be a Float32Array.');
+  if (vertexLayouts.length !== 1) {
+    throw new Error('GeometryArena currently supports exactly one vertex layout.');
+  }
+  const layout = vertexLayouts[0]!;
+  if (layout.stepMode !== 'vertex') {
+    throw new Error('GeometryArena currently supports only vertex-step layouts.');
+  }
+  if (!Number.isSafeInteger(layout.arrayStride) || layout.arrayStride <= 0 || layout.arrayStride % 4 !== 0) {
+    throw new Error('VertexLayoutDesc.arrayStride must be a positive 4-byte-aligned integer.');
+  }
+  if (layout.attributes.length === 0) throw new Error('Vertex layout must declare at least one attribute.');
+  const locations = new Set<number>();
+  for (const attribute of layout.attributes) {
+    const size = vertexAttributeSize(attribute.format);
+    if (!Number.isSafeInteger(attribute.shaderLocation) || attribute.shaderLocation < 0 || locations.has(attribute.shaderLocation)) {
+      throw new Error('Vertex attribute shaderLocation must be a unique non-negative integer.');
+    }
+    if (!Number.isSafeInteger(attribute.offset) || attribute.offset < 0 || attribute.offset % 4 !== 0 || attribute.offset + size > layout.arrayStride) {
+      throw new Error('Vertex attribute offset is outside the vertex stride or is not 4-byte aligned.');
+    }
+    locations.add(attribute.shaderLocation);
+  }
+  if (vertexData.byteLength === 0 || vertexData.byteLength % layout.arrayStride !== 0) {
+    throw new Error('vertexData byteLength must be a non-zero multiple of arrayStride.');
+  }
+  for (let i = 0; i < vertexData.length; i++) {
+    if (!Number.isFinite(vertexData[i])) throw new Error(`vertexData[${i}] must be finite.`);
+  }
+  if (indexData) {
+    if (!(indexData instanceof Uint16Array) && !(indexData instanceof Uint32Array)) {
+      throw new Error('indexData must be a Uint16Array or Uint32Array.');
+    }
+    const inferred = indexData instanceof Uint32Array ? 'uint32' : 'uint16';
+    if (indexFormat && indexFormat !== inferred) {
+      throw new Error(`indexFormat ${indexFormat} does not match ${inferred} indexData.`);
+    }
+    const vertexCount = vertexData.byteLength / layout.arrayStride;
+    for (let i = 0; i < indexData.length; i++) {
+      if (indexData[i]! >= vertexCount) throw new Error(`indexData[${i}] exceeds vertexCount ${vertexCount}.`);
+    }
+    if (primitive === 'triangle-list' && indexData.length % 3 !== 0) {
+      throw new Error('triangle-list indexData length must be a multiple of 3.');
+    }
+  }
+}
+
+function vertexAttributeSize(format: GPUVertexFormat): number {
+  switch (format) {
+    case 'uint8':
+    case 'uint8x2':
+    case 'uint8x4':
+    case 'sint8':
+    case 'sint8x2':
+    case 'sint8x4':
+    case 'unorm8':
+    case 'unorm8x2':
+    case 'unorm8x4':
+    case 'snorm8':
+    case 'snorm8x2':
+    case 'snorm8x4': return format.endsWith('x2') ? 2 : format.endsWith('x4') ? 4 : 1;
+    case 'uint16':
+    case 'uint16x2':
+    case 'uint16x4':
+    case 'sint16':
+    case 'sint16x2':
+    case 'sint16x4':
+    case 'unorm16':
+    case 'unorm16x2':
+    case 'unorm16x4':
+    case 'snorm16':
+    case 'snorm16x2':
+    case 'snorm16x4': return format.endsWith('x2') ? 4 : format.endsWith('x4') ? 8 : 2;
+    case 'float32':
+    case 'float32x2':
+    case 'float32x3':
+    case 'float32x4': return format.endsWith('x2') ? 8 : format.endsWith('x3') ? 12 : format.endsWith('x4') ? 16 : 4;
+    case 'uint32':
+    case 'uint32x2':
+    case 'uint32x3':
+    case 'uint32x4':
+    case 'sint32':
+    case 'sint32x2':
+    case 'sint32x3':
+    case 'sint32x4': return format.endsWith('x2') ? 8 : format.endsWith('x3') ? 12 : format.endsWith('x4') ? 16 : 4;
+     case 'float16':
+     case 'float16x2':
+     case 'float16x4': return format.endsWith('x2') ? 4 : format.endsWith('x4') ? 8 : 2;
+    case 'unorm10-10-10-2':
+    case 'unorm8x4-bgra': return 4;
+    default: throw new Error(`Unsupported vertex format: ${format}`);
   }
 }
 
@@ -328,6 +445,7 @@ function computePositionBounds(
   for (const layout of layouts) {
     const posAttr = layout.attributes.find((a) => a.shaderLocation === 0);
     if (posAttr) {
+      if (posAttr.format !== 'float32x3') return undefined;
       const strideFloats = layout.arrayStride / 4;
       if (strideFloats <= 0) return undefined;
       const base = prefixBytes / 4 + posAttr.offset / 4;
@@ -387,15 +505,15 @@ function allocFrom(frees: FreeBlock[], aligned: number): ArenaAlloc | null {
 }
 
 function align4(x: number): number {
-  return (x + 3) & ~3;
+  return Math.ceil(x / 4) * 4;
 }
 
 function align16(x: number): number {
-  return (x + 15) & ~15;
+  return Math.ceil(x / 16) * 16;
 }
 
 function align(x: number, a: number): number {
-  return (x + a - 1) & ~(a - 1);
+  return Math.ceil(x / a) * a;
 }
 
 function nextPow2(x: number): number {

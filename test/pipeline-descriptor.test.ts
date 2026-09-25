@@ -40,15 +40,38 @@ function makeGeometry(renderer: Renderer): Geometry {
   return renderer.createGeometry(new Float32Array(9), LAYOUT, new Uint16Array([0, 1, 2]));
 }
 
+function customInstanceLayoutShader(base: string, modelMatrixOffset: number): string {
+  const marker = `struct InstanceData {
+    modelMatrix: mat4x4<f32>,
+    color: vec4<f32>,
+};`;
+  const replacement = modelMatrixOffset === 16
+    ? `struct InstanceData {
+    padding: vec4<f32>,
+    modelMatrix: mat4x4<f32>,
+    color: vec4<f32>,
+};`
+    : `struct InstanceData {
+    modelMatrix: mat4x4<f32>,
+    color: vec4<f32>,
+    padding: vec4<f32>,
+};`;
+  if (!base.includes(marker)) throw new Error('test shader does not contain InstanceData');
+  return base.replace(marker, replacement);
+}
+
 function register(
   renderer: Renderer,
   device: GPUDevice,
   globalBindings: GlobalBinding[],
   extra: Partial<PipelineDesc> = {},
 ): ResolvedPipeline {
+  const baseShader = extra.vsCode ?? (extra.compaction ? VS_INSTANCED_COMPACTION : VS_INSTANCED);
+  const customLayout = extra.bytesPerInstance !== undefined || extra.modelMatrixOffset !== undefined;
+  const vsCode = customLayout ? customInstanceLayoutShader(baseShader, extra.modelMatrixOffset ?? 0) : baseShader;
   return renderer.registerPipeline({
     label: 'descriptor-contract',
-    vsCode: extra.compaction ? VS_INSTANCED_COMPACTION : VS_INSTANCED,
+    vsCode,
     fsCode: FS_COLOR,
     vertexLayouts: LAYOUT,
     bindGroupLayouts: [uniformBindGroupLayout(device, [
@@ -57,6 +80,7 @@ function register(
     globalBindings,
     depth: DEPTH,
     targets: [{ format: FORMAT }],
+    compactionContract: extra.compaction && customLayout ? 'hpg-compaction-v1' : extra.compactionContract,
     ...extra,
   });
 }
@@ -80,22 +104,22 @@ function instanceWrite(recorded: ReturnType<typeof createFakeGPU>['recorded'], s
 describe('GlobalBinding 契约', () => {
   it('byteOffset / byteLength 真正进入 createBindGroup（不再静默绑整块 buffer）', () => {
     const { renderer, device, recorded } = setup();
-    const buffer = device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const buffer = device.createBuffer({ size: 512, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
-    const sliced = register(renderer, device, [{ binding: 0, buffer, byteOffset: 64, byteLength: 64 }]);
+    const sliced = register(renderer, device, [{ binding: 0, buffer, byteOffset: 256, byteLength: 64 }]);
     renderer.submit([item(makeGeometry(renderer), sliced)]);
     const slicedBG = recorded.bindGroups.find((b) => b.label.includes('global'));
     expect(slicedBG).toBeDefined();
-    expect(slicedBG!.bindings[0]!.offset).toBe(64);
+    expect(slicedBG!.bindings[0]!.offset).toBe(256);
     expect(slicedBG!.bindings[0]!.size).toBe(64);
   });
 
   it('同一 buffer 的不同切片 ⇒ 不同管线 + 不同 bind group（缓存键含 offset/size）', () => {
     const { renderer, device, recorded } = setup();
-    const buffer = device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const buffer = device.createBuffer({ size: 512, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
     const lower = register(renderer, device, [{ binding: 0, buffer, byteOffset: 0, byteLength: 64 }]);
-    const upper = register(renderer, device, [{ binding: 0, buffer, byteOffset: 64, byteLength: 64 }]);
+    const upper = register(renderer, device, [{ binding: 0, buffer, byteOffset: 256, byteLength: 64 }]);
     expect(lower.id).not.toBe(upper.id);
 
     const geo = makeGeometry(renderer);
@@ -103,7 +127,13 @@ describe('GlobalBinding 契约', () => {
 
     const globals = recorded.bindGroups.filter((b) => b.label.includes('global'));
     expect(globals).toHaveLength(2);
-    expect(globals.map((g) => g.bindings[0]!.offset).sort((a, b) => a - b)).toEqual([0, 64]);
+    expect(globals.map((g) => g.bindings[0]!.offset).sort((a, b) => a - b)).toEqual([0, 256]);
+  });
+
+  it('拒绝未按设备 uniform 对齐的静态偏移', () => {
+    const { renderer, device } = setup();
+    const buffer = device.createBuffer({ size: 512, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    expect(() => register(renderer, device, [{ binding: 0, buffer, byteOffset: 64, byteLength: 64 }])).toThrow(/aligned/);
   });
 
   it('未声明 offset/size 时保持原有行为（绑整块 buffer，无 static offset）', () => {
@@ -177,7 +207,7 @@ describe('modelMatrixOffset 契约', () => {
 
     expect(() => register(renderer, device, [{ binding: 0, buffer }], { modelMatrixOffset: 8 })).toThrow(/16 的倍数/);
     expect(() => register(renderer, device, [{ binding: 0, buffer }], { modelMatrixOffset: -16 })).toThrow(/非负/);
-    expect(() => register(renderer, device, [{ binding: 0, buffer }], { bytesPerInstance: 65 })).toThrow(/4 字节/);
+    expect(() => register(renderer, device, [{ binding: 0, buffer }], { bytesPerInstance: 65 })).toThrow(/16 字节/);
     expect(() =>
       register(renderer, device, [{ binding: 0, buffer }], { bytesPerInstance: 64, modelMatrixOffset: 16 }),
     ).toThrow(/bytesPerInstance/);

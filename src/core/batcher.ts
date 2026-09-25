@@ -60,7 +60,7 @@ export class Batcher {
       // 相邻同 pipeline + geometry 合并为一批。
       while (
         j < n &&
-        items[j]!.pipeline.id === item.pipeline.id &&
+        items[j]!.pipeline === item.pipeline &&
         items[j]!.geometry === item.geometry &&
         items[j]!.bindGroup === item.bindGroup
       ) {

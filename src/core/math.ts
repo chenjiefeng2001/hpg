@@ -26,13 +26,12 @@ export function copy(out: Mat4, src: Mat4): Mat4 {
  */
 export function perspective(fovYRad: number, aspect: number, near: number, far: number): Mat4 {
   const f = 1 / Math.tan(fovYRad / 2);
-  const nf = 1 / (near - far);
   const m = new Float32Array(16);
   m[0] = f / aspect;
   m[5] = f;
-  m[10] = (far + near) * nf;
+  m[10] = far / (near - far);
   m[11] = -1;
-  m[14] = 2 * far * near * nf;
+  m[14] = (far * near) / (near - far);
   return m;
 }
 
@@ -222,10 +221,10 @@ export function orthographic(out: Mat4, left: number, right: number, bottom: num
   out.fill(0);
   out[0] = -2 * lr;
   out[5] = -2 * bt;
-  out[10] = 2 * nf;
+  out[10] = nf;
   out[12] = (left + right) * lr;
   out[13] = (top + bottom) * bt;
-  out[14] = (far + near) * nf;
+  out[14] = near * nf;
   out[15] = 1;
   return out;
 }

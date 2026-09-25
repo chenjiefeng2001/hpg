@@ -103,7 +103,7 @@ const SLOT_ALIGN = 64;
 
 /** 向上对齐到 SLOT_ALIGN。 */
 function alignSlots(n: number): number {
-  return (n + SLOT_ALIGN - 1) & ~(SLOT_ALIGN - 1);
+  return Math.ceil(n / SLOT_ALIGN) * SLOT_ALIGN;
 }
 
 /**
@@ -228,8 +228,8 @@ export class CullingPipeline {
    * @param spheresData N × vec4(cx, cy, cz, radius)
    * @param geometryIds N × u32，每个 instance 所属 geometry 的索引
    * @param geometryCount 总 geometry 数量
-   * @param drawArgsTemplate G × 5 的 u32 模板（indexCount / instanceCount / firstIndex /
-   *        baseVertex / firstInstance）。instanceCount 位忽略（强制置 0，由 compute 原子填充）。
+    * @param drawArgsTemplate G × 5 的 u32 模板（indexCount / instanceCount / firstIndex /
+    *        baseVertex / firstInstance），geometryCount > 0 时必须提供且长度精确匹配。instanceCount 位忽略（强制置 0，由 compute 原子填充）。
    *
    *        **必须在 dispatch 之前写入**：`queue.writeBuffer` 按入队顺序执行，
    *        dispatch 之后再写会把 GPU 刚原子填充的 instanceCount 覆盖回 0 →
@@ -243,6 +243,7 @@ export class CullingPipeline {
     geometryCount: number,
     drawArgsTemplate?: Uint32Array,
     timestamps?: TimestampQuery,
+    commandEncoder?: GPUCommandEncoder,
   ): {
     drawArgsBuffer: GPUBuffer;
     compactedIndicesBuffer: GPUBuffer;
@@ -252,7 +253,42 @@ export class CullingPipeline {
     /** compactedIndices 的绑定尺寸（字节）= 单个 geometry 的最大 slot 区。 */
     maxSlotBytes: number;
   } {
+    if (!Number.isSafeInteger(geometryCount) || geometryCount < 0) {
+      throw new Error('geometryCount must be a non-negative safe integer.');
+    }
+    if (geometryCount > 0 && !drawArgsTemplate) {
+      throw new Error('drawArgsTemplate is required when geometryCount is greater than zero.');
+    }
+    if (drawArgsTemplate && drawArgsTemplate.length !== geometryCount * 5) {
+      throw new Error(`drawArgsTemplate length must equal geometryCount * 5 (${geometryCount * 5}).`);
+    }
+    if (spheresData.length % FLOATS_PER_SPHERE !== 0) {
+      throw new Error('spheresData length must be a multiple of 4.');
+    }
+    if (vpMatrix.length !== 16) throw new Error('vpMatrix must contain exactly 16 values.');
+    for (let i = 0; i < vpMatrix.length; i++) {
+      if (!Number.isFinite(vpMatrix[i])) throw new Error(`vpMatrix[${i}] must be finite.`);
+    }
     const n = spheresData.length / FLOATS_PER_SPHERE;
+    if (geometryIds.length !== n) {
+      throw new Error(`geometryIds length (${geometryIds.length}) must equal sphere count (${n}).`);
+    }
+    let previousGeometry = 0;
+    for (let i = 0; i < n; i++) {
+      const g = geometryIds[i] as number;
+      if (g >= geometryCount) throw new Error(`geometryIds[${i}] exceeds geometryCount.`);
+      if (i > 0 && g < previousGeometry) {
+        throw new Error('geometryIds must be grouped in non-decreasing order.');
+      }
+      previousGeometry = g;
+      for (let c = 0; c < FLOATS_PER_SPHERE; c++) {
+        const value = spheresData[i * FLOATS_PER_SPHERE + c] as number;
+        if (!Number.isFinite(value)) throw new Error(`spheresData[${i * FLOATS_PER_SPHERE + c}] must be finite.`);
+      }
+      if (spheresData[i * FLOATS_PER_SPHERE + 3]! < 0) {
+        throw new Error(`spheresData[${i * FLOATS_PER_SPHERE + 3}] must be non-negative.`);
+      }
+    }
 
     // 逐个 geometry 统计候选数，并计算 [candidateBase, slotBase]。
     // candidateBase 用于把全局索引换算成组内索引；slotBase 给 VS 的 dynamic offset 用。
@@ -306,16 +342,19 @@ export class CullingPipeline {
     const bindGroup = this.ensureBindGroup();
 
     // Dispatch compute。
-    const encoder = this.device.createCommandEncoder({ label: 'hpg:cull-encoder' });
-    const pass = encoder.beginComputePass({ label: 'hpg:cull-pass' });
-    if (timestamps) timestamps.writeTimestamp(pass, 0);
+    const ownsEncoder = commandEncoder === undefined;
+    const encoder = commandEncoder ?? this.device.createCommandEncoder({ label: 'hpg:cull-encoder' });
+     const pass = encoder.beginComputePass({
+       label: 'hpg:cull-pass',
+       ...(timestamps ? { timestampWrites: timestamps.timestampWrites(0, 1) } : {}),
+     });
     pass.setPipeline(this._pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(Math.ceil(n / WORKGROUP_SIZE));
-    if (timestamps) timestamps.writeTimestamp(pass, 1);
+
     pass.end();
     if (timestamps) timestamps.resolve(encoder);
-    this.device.queue.submit([encoder.finish()]);
+    if (ownsEncoder) this.device.queue.submit([encoder.finish()]);
 
     return {
       drawArgsBuffer: bufs.drawArgs,

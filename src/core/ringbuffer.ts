@@ -134,16 +134,16 @@ export class RingBuffer {
 }
 
 export function align16(x: number): number {
-  return (x + 15) & ~15;
+  return Math.ceil(x / 16) * 16;
 }
 
 /** 向上对齐到 2 的幂 `alignment`（默认 16）。 */
 export function alignTo(x: number, alignment = 16): number {
-  return (x + alignment - 1) & ~(alignment - 1);
+  return Math.ceil(x / alignment) * alignment;
 }
 
 export function align256(x: number): number {
-  return (x + 255) & ~255;
+  return Math.ceil(x / 256) * 256;
 }
 
 function createDynamicBuffer(device: GPUDevice, size: number): GPUBuffer {

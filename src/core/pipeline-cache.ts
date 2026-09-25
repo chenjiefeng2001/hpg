@@ -40,11 +40,12 @@ export function canonicalize(desc: PipelineDesc): string {
     fs: desc.fsCode,
     bpi: desc.bytesPerInstance ?? 80,
     mmo: desc.modelMatrixOffset ?? 0,
-    // compaction 决定 group=1 的绑定布局（単实例 vs 实例+compaction mapping）。
-    cmp: desc.compaction === true,
-    v: desc.vertexLayouts,
+     // compaction 决定 group=1 的绑定布局（単实例 vs 实例+compaction mapping）。
+     cmp: desc.compaction === true,
+     cc: desc.compactionContract ?? '',
+     v: desc.vertexLayouts,
     bgl: desc.bindGroupLayouts.map((l) => `${objectId(l)}:${l.label ?? ''}`),
-    g: desc.globalBindings.map((b) => `${b.binding}:${objectId(b.buffer)}:${b.buffer.size}:${b.byteOffset ?? 0}:${b.byteLength ?? 0}`),
+     g: desc.globalBindings.map((b) => `${b.binding}:${objectId(b.buffer)}:${b.buffer.size}:${b.byteOffset ?? 0}:${b.byteLength ?? 0}`),
     d: desc.depth,
     t: desc.targets,
     p: desc.primitive,
@@ -54,9 +55,15 @@ export function canonicalize(desc: PipelineDesc): string {
 export class PipelineCache {
   private _map = new Map<string, ResolvedPipeline>();
   private _nextId = 0;
+  private _device: GPUDevice | null = null;
 
   get size(): number {
     return this._map.size;
+  }
+
+  clear(): void {
+    this._map.clear();
+    this._device = null;
   }
 
   /** 尝试命中；未命中则创建。返回 [pipeline, created]。使用 canonical string 作 key 避免哈希碰撞。 */
@@ -65,6 +72,10 @@ export class PipelineCache {
     desc: PipelineDesc,
     onStats?: (created: boolean) => void,
   ): ResolvedPipeline {
+    if (this._device && this._device !== device) {
+      throw new Error('PipelineCache cannot be reused across GPU devices.');
+    }
+    this._device = device;
     const canonical = canonicalize(desc);
     const existing = this._map.get(canonical);
     if (existing) {
@@ -80,7 +91,50 @@ export class PipelineCache {
   }
 }
 
-export function createResolved(device: GPUDevice, desc: PipelineDesc, id: number): ResolvedPipeline {
+function clonePipelineDesc(desc: PipelineDesc): PipelineDesc {
+  return {
+    ...desc,
+    vertexLayouts: desc.vertexLayouts.map((layout) => ({
+      ...layout,
+      attributes: layout.attributes.map((attribute) => ({ ...attribute })),
+    })),
+    bindGroupLayouts: [...desc.bindGroupLayouts],
+    globalBindings: desc.globalBindings.map((binding) => ({ ...binding })),
+    targets: desc.targets.map((target) => ({
+      ...target,
+      blend: target.blend ? { ...target.blend } : undefined,
+      writeMask: target.writeMask,
+    })),
+    depth: desc.depth ? { ...desc.depth } : undefined,
+    primitive: desc.primitive ? { ...desc.primitive } : undefined,
+  };
+}
+
+function freezePipelineDesc(desc: PipelineDesc): PipelineDesc {
+  const frozen = {
+    ...desc,
+    vertexLayouts: desc.vertexLayouts.map((layout) => Object.freeze({
+      ...layout,
+      attributes: Object.freeze(layout.attributes.map((attribute) => Object.freeze({ ...attribute }))),
+    })),
+    bindGroupLayouts: [...desc.bindGroupLayouts],
+    globalBindings: desc.globalBindings.map((binding) => Object.freeze({ ...binding })),
+    targets: desc.targets.map((target) => Object.freeze({
+      ...target,
+      blend: target.blend ? Object.freeze({ ...target.blend }) : undefined,
+    })),
+    depth: desc.depth ? Object.freeze({ ...desc.depth }) : undefined,
+    primitive: desc.primitive ? Object.freeze({ ...desc.primitive }) : undefined,
+  };
+  Object.freeze(frozen.vertexLayouts);
+  Object.freeze(frozen.bindGroupLayouts);
+  Object.freeze(frozen.globalBindings);
+  Object.freeze(frozen.targets);
+  return Object.freeze(frozen) as PipelineDesc;
+}
+
+export function createResolved(device: GPUDevice, input: PipelineDesc, id: number): ResolvedPipeline {
+  const desc = freezePipelineDesc(clonePipelineDesc(input));
   const bgls = desc.bindGroupLayouts;
   const pipelineLayout = device.createPipelineLayout({
     label: `hpg:pl:${desc.label ?? id}`,
@@ -112,8 +166,9 @@ export function createResolved(device: GPUDevice, desc: PipelineDesc, id: number
     depthStencil: desc.depth as GPUDepthStencilState | undefined,
   });
 
-  return {
+  return Object.freeze({
     id,
+    device,
     desc,
     pipeline,
     layout: bgls[0],
@@ -121,7 +176,7 @@ export function createResolved(device: GPUDevice, desc: PipelineDesc, id: number
     bytesPerInstance,
     modelMatrixOffset,
     label,
-  };
+  });
 }
 
 function createShaderModule(device: GPUDevice, code: string, label: string): GPUShaderModule {

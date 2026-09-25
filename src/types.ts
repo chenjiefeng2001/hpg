@@ -35,7 +35,7 @@ export interface Aabb {
  * 静态几何体：持有已上传的顶点/索引 Buffer 与绘制描述。
  * 通过 GeometryArena 注册，得到的实例可作为资源句柄。
  *
- * 多顶点 buffer 支持：vertexBuffers[] 数组中每个元素对应一个 slot。
+ * 几何描述保留 vertexBuffers[] slot 形状；当前 GeometryArena 上传 API 只接受一个 vertex-step layout。
  * vertexBuffer / vertexSlice 始终指向 vertexBuffers[0]（向后兼容）。
  */
 export interface Geometry {
@@ -61,6 +61,7 @@ export interface Geometry {
 export interface GlobalBinding {
   binding: number;
   buffer: GPUBuffer;
+  /** uniform buffer 的字节偏移。 */
   byteOffset?: number;
   byteLength?: number;
 }
@@ -76,7 +77,8 @@ export interface PipelineDesc {
    * **必须等于该管线 WGSL 中 `InstanceData` 的 sizeof** —— 着色器总是按自己的
    * 结构体跨步索引实例（`instances[instance_index]`），跨步不一致会读到错位数据。
    * 库内置的 VS_INSTANCED / VS_INSTANCED_COMPACTION 固定为
-   * `mat4x4<f32> + vec4<f32>` = 80 字节；自定义结构体必须同步声明此值。
+   * `mat4x4<f32> + vec4<f32>` = 80 字节；内置 shader 只能使用 80/0 布局，
+   * 自定义结构体必须同步声明此值。
    */
   bytesPerInstance?: number;
   /** 实例数据中 modelMatrix 的字节偏移（列主序）。默认 0。 */
@@ -90,6 +92,11 @@ export interface PipelineDesc {
    * Renderer.submitCulled() 使用。默认 false（普通实例绑定）。
    */
   compaction?: boolean;
+  /**
+   * 自定义 compaction 顶点着色器的受信契约标记。内置两个 compaction shader
+   * 不需要此字段；自定义 WGSL 必须显式声明 runtime 已验证其消费 mapping。
+   */
+  compactionContract?: 'hpg-compaction-v1';
   vertexLayouts: VertexLayoutDesc[];
   bindGroupLayouts: GPUBindGroupLayout[];
   globalBindings: GlobalBinding[];
@@ -101,6 +108,7 @@ export interface PipelineDesc {
 /** 已解析（可被缓存池命中）的管线。 */
 export interface ResolvedPipeline {
   id: number;
+  device?: GPUDevice;
   desc: PipelineDesc;
   pipeline: GPURenderPipeline;
   layout: GPUBindGroupLayout;
@@ -134,7 +142,10 @@ export interface RenderItem {
   transforms?: Float32Array;
   /** 实例个数 = transforms.length / 16，缺省自动推导。 */
   instanceCount?: number;
-  /** 每实例跨步扁平数据（modelMatrix 偏移之外的部分），长度必须为 instanceCount * stride。 */
+  /**
+   * 每实例 modelMatrix 之后的扁平数据。提供时长度必须精确等于
+   * instanceCount × (bytesPerInstance - modelMatrixOffset - 64) / 4。
+   */
   instanceData?: Float32Array;
   /** 声明后才有资格进入后续 GPU 剔除。 */
   bounding?: BoundingSphere;

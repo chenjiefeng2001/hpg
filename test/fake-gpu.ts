@@ -42,10 +42,15 @@ export interface FakeRecorded {
   indirectDraws: FakeIndirectDraw[];
   /** setIndexBuffer 调用次数。 */
   indexBufferBinds: number;
+  vertexBufferBinds: { slot: number; buffer: unknown; offset: number; size?: number }[];
+  indexBufferBindsDetail: { buffer: unknown; format: string; offset: number; size?: number }[];
+  renderPassDescriptors: Record<string, unknown>[];
+  computePassDescriptors: Record<string, unknown>[];
   /** render pass 内的 setBindGroup(group, bindGroup, dynamicOffsets)。 */
   renderBinds: { group: number; offsets: number[]; bindGroup?: unknown }[];
   /** compute dispatch 次数。 */
   dispatches: number;
+  submits: number;
   /**
    * 模拟 Dawn 的 dynamic offset 越界校验：
    * `bindingOffset + dynamicOffset + bindingSize <= bufferSize`。
@@ -76,7 +81,12 @@ export function createFakeGPU(): { device: GPUDevice; context: GPUCanvasContext;
     bindGroups: [],
     indirectDraws: [],
     indexBufferBinds: 0,
+    vertexBufferBinds: [],
+    indexBufferBindsDetail: [],
+    renderPassDescriptors: [],
+    computePassDescriptors: [],
     dispatches: 0,
+    submits: 0,
     renderBinds: [],
     gpuErrors: [],
     ops: [],
@@ -89,6 +99,7 @@ export function createFakeGPU(): { device: GPUDevice; context: GPUCanvasContext;
   const bindGroupRecords = new WeakMap<object, FakeBindGroupRecord>();
   // bind group layout 对象 → 各 binding 是否带 dynamic offset。
   const layoutDynamic = new WeakMap<object, Map<number, boolean>>();
+  const layoutBufferTypes = new WeakMap<object, Map<number, string>>();
 
   const fakePass = {
     setPipeline: () => undefined,
@@ -96,8 +107,13 @@ export function createFakeGPU(): { device: GPUDevice; context: GPUCanvasContext;
       recorded.renderBinds.push({ group, offsets: offsets ? [...offsets] : [], bindGroup: bg });
       validateDynamicOffsets(bg, offsets);
     },
-    setVertexBuffer: () => undefined,
-    setIndexBuffer: () => { recorded.indexBufferBinds++; },
+    setVertexBuffer: (slot: number, buffer: GPUBuffer, offset: number, size?: number) => {
+      recorded.vertexBufferBinds.push({ slot, buffer, offset, size });
+    },
+    setIndexBuffer: (buffer: GPUBuffer, format: string, offset: number, size?: number) => {
+      recorded.indexBufferBinds++;
+      recorded.indexBufferBindsDetail.push({ buffer, format, offset, size });
+    },
     draw: () => undefined,
     drawIndexed: (indexCount: number, instanceCount: number, _v0: number, _v1: number) => {
       recorded.drawCalls.push({ indexCount, instanceCount, vertexOffset: _v0, pipeline: {} });
@@ -108,7 +124,6 @@ export function createFakeGPU(): { device: GPUDevice; context: GPUCanvasContext;
     drawIndexedIndirect: (buffer: GPUBuffer, offset: number) => {
       recorded.indirectDraws.push({ buffer, offset, indexed: true });
     },
-    writeTimestamp: () => undefined,
     end: () => undefined,
   } as unknown as GPURenderPassEncoder;
 
@@ -119,13 +134,19 @@ export function createFakeGPU(): { device: GPUDevice; context: GPUCanvasContext;
       recorded.dispatches++;
       recorded.ops.push({ kind: 'dispatch' });
     },
-    writeTimestamp: () => undefined,
     end: () => undefined,
   } as unknown as GPUComputePassEncoder;
 
   const fakeEncoder = {
-    beginRenderPass: () => { recorded.passCount++; return fakePass; },
-    beginComputePass: () => fakeComputePass,
+    beginRenderPass: (descriptor: Record<string, unknown>) => {
+      recorded.passCount++;
+      recorded.renderPassDescriptors.push(descriptor);
+      return fakePass;
+    },
+    beginComputePass: (descriptor: Record<string, unknown>) => {
+      recorded.computePassDescriptors.push(descriptor);
+      return fakeComputePass;
+    },
     finish: () => ({}) as unknown as GPUCommandBuffer,
     resolveQuerySet: () => undefined,
     copyBufferToBuffer: () => undefined,
@@ -139,9 +160,18 @@ export function createFakeGPU(): { device: GPUDevice; context: GPUCanvasContext;
    *   and a bound range of (offset: 0, size: 1048576). Did you forget to specify the binding's size?
    */
   const validateDynamicOffsets = (bg: GPUBindGroup, offsets?: number[]): void => {
-    if (!offsets || offsets.length === 0 || !bg) return;
+    if (!bg) return;
     const rec = bindGroupRecords.get(bg as unknown as object);
     if (!rec) return;
+    const dynamicEntries = rec.bindings.filter((e) => e.dynamic);
+    if (dynamicEntries.length === 0) return;
+    if (!offsets) {
+      recorded.gpuErrors.push(`Expected ${dynamicEntries.length} dynamic offsets.`);
+      return;
+    }
+    if (offsets.length !== dynamicEntries.length) {
+      recorded.gpuErrors.push(`Expected ${dynamicEntries.length} dynamic offsets, received ${offsets.length}.`);
+    }
     let dynIndex = 0;
     for (const e of rec.bindings) {
       if (!e.dynamic) continue;
@@ -166,10 +196,13 @@ export function createFakeGPU(): { device: GPUDevice; context: GPUCanvasContext;
     createBindGroupLayout: (desc: GPUBindGroupLayoutDescriptor) => {
       const layout = {} as unknown as GPUBindGroupLayout;
       const dyn = new Map<number, boolean>();
+      const types = new Map<number, string>();
       for (const e of desc.entries ?? []) {
         dyn.set(e.binding, e.buffer?.hasDynamicOffset ?? false);
+        if (e.buffer?.type) types.set(e.binding, e.buffer.type);
       }
       layoutDynamic.set(layout as unknown as object, dyn);
+      layoutBufferTypes.set(layout as unknown as object, types);
       return layout;
     },
     createPipelineLayout: () => ({}) as unknown as GPUPipelineLayout,
@@ -181,6 +214,19 @@ export function createFakeGPU(): { device: GPUDevice; context: GPUCanvasContext;
     createComputePipeline: () => ({}) as unknown as GPUComputePipeline,
     createBindGroup: (desc: GPUBindGroupDescriptor) => {
       const dyn = layoutDynamic.get(desc.layout as unknown as object);
+      const types = layoutBufferTypes.get(desc.layout as unknown as object);
+      for (const entry of desc.entries ?? []) {
+        const resource = entry.resource as GPUBufferBinding | GPUBuffer | undefined;
+        if (!resource || typeof resource !== 'object' || !('buffer' in resource)) continue;
+        const binding = resource as GPUBufferBinding;
+        const offset = binding.offset ?? 0;
+        const size = binding.size ?? ((binding.buffer as { size?: number }).size ?? 0) - offset;
+        const type = types?.get(entry.binding);
+        const alignment = type === 'uniform' ? 256 : type === 'storage' ? 256 : 4;
+        if (offset % alignment !== 0 || size <= 0 || offset + size > ((binding.buffer as { size?: number }).size ?? 0)) {
+          recorded.gpuErrors.push(`Invalid binding range for ${entry.binding}.`);
+        }
+      }
       const record: FakeBindGroupRecord = {
         label: desc.label ?? '',
         bindings: Array.from(desc.entries ?? []).map((e) => {
@@ -225,7 +271,7 @@ export function createFakeGPU(): { device: GPUDevice; context: GPUCanvasContext;
       destroy() {},
     }) as unknown as GPUQuerySet,
     queue: {
-      submit: () => undefined,
+       submit: () => { recorded.submits++; },
       writeTexture: (
         destination: { texture: GPUTexture },
         data: ArrayBuffer | ArrayBufferView,
@@ -269,11 +315,23 @@ export function createFakeGPU(): { device: GPUDevice; context: GPUCanvasContext;
     },
   } as unknown as GPUDevice;
 
+  let configuredFormat: GPUTextureFormat | undefined = 'bgra8unorm';
+  let configuredUsage = GPUTextureUsage.RENDER_ATTACHMENT;
+  let configuredDevice: GPUDevice | undefined = device;
   const context = {
     canvas: { width: 640, height: 480 },
     getCurrentTexture: () => ({ createView: () => ({}) }) as unknown as GPUTexture,
-    configure: () => undefined,
-    unconfigure: () => undefined,
+    configure: (descriptor: { device: GPUDevice; format: GPUTextureFormat; usage?: number }) => {
+      configuredDevice = descriptor.device;
+      configuredFormat = descriptor.format;
+      configuredUsage = descriptor.usage ?? GPUTextureUsage.RENDER_ATTACHMENT;
+    },
+    unconfigure: () => {
+      configuredFormat = undefined;
+      configuredUsage = GPUTextureUsage.RENDER_ATTACHMENT;
+      configuredDevice = undefined;
+    },
+    getConfiguration: () => configuredFormat ? { device: configuredDevice, format: configuredFormat, usage: configuredUsage } : null,
   } as unknown as GPUCanvasContext;
 
   return { device, context, recorded };
