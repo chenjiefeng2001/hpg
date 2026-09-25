@@ -14,6 +14,7 @@
  *   npm run verify:browser                 # 全部语料 × direct,culled
  *   npm run verify:browser -- medium       # 路径子串过滤
  *   node benchmark/browser-material-check.mjs --modes=direct --limit=3 --smoke
+ *   node benchmark/browser-material-check.mjs --culling-matrix
  */
 
 import { spawn } from 'node:child_process';
@@ -48,7 +49,8 @@ const FILTER = flag('filter', argv.find((a) => !a.startsWith('--')) ?? '');
 const MODES = flag('modes', 'direct,culled').split(',').map((s) => s.trim()).filter(Boolean);
 if (MODES.length === 0 || MODES.some((mode) => mode !== 'direct' && mode !== 'culled')) throw new Error(`Unsupported mode in --modes: ${MODES.join(',')}`);
 const SMOKE = argv.includes('--smoke');
-if (!SMOKE && (!MODES.includes('direct') || !MODES.includes('culled'))) throw new Error('Full gate requires both direct and culled modes; use --smoke for a single-mode smoke test.');
+const CULLING_MATRIX = argv.includes('--culling-matrix');
+if (!SMOKE && !CULLING_MATRIX && (!MODES.includes('direct') || !MODES.includes('culled'))) throw new Error('Full gate requires both direct and culled modes; use --smoke for a single-mode smoke test.');
 const LIMIT = Number(flag('limit', '0')) || 0;
 const PARTIAL_RUN = FILTER !== '' || LIMIT > 0;
 
@@ -270,6 +272,68 @@ async function runPage(cdp, url, timeoutMs = 30000) {
   }
 }
 
+async function runCullingMatrixPage(cdp, url, timeoutMs = 120000) {
+  const { targetId } = await cdp.send('Target.createTarget', { url });
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+  const evaluate = async (expression) => {
+    const r = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
+    return r?.result?.value;
+  };
+  try {
+    await cdp.send('Runtime.enable', {}, sessionId);
+    await cdp.send('Page.enable', {}, sessionId);
+    await cdp.send('Page.bringToFront', {}, sessionId).catch(() => {});
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const value = await evaluate('window.__hpgCullingMatrix ? JSON.stringify(window.__hpgCullingMatrix) : null');
+      if (value) return JSON.parse(value);
+      await sleep(250);
+    }
+    const diag = await evaluate(`JSON.stringify({
+      gpu: !!navigator.gpu,
+      stats: (document.getElementById('results')||{}).textContent || '',
+      errors: (document.getElementById('errors')||{}).textContent || '',
+    })`);
+    return { results: [], ok: false, diag: diag ? JSON.parse(diag) : null };
+  } finally {
+    cdp.send('Target.closeTarget', { targetId }).catch(() => {});
+  }
+}
+
+async function runCullingMatrixMain() {
+  const chromeExe = findChrome();
+  console.log('hpg — GPU culling correctness matrix');
+  console.log(`chrome : ${chromeExe}`);
+  console.log('');
+  const vite = await startVite();
+  let chrome;
+  let cdp;
+  try {
+    chrome = await launchChrome(chromeExe);
+    cdp = await connect(chrome.port);
+    await assertWebGpuAdapter(cdp);
+    const result = await runCullingMatrixPage(cdp, `${BASE}/benchmark/index.html?matrix=1`);
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.ok) {
+      process.exitCode = 1;
+      return;
+    }
+    console.log('通过：0% / 10% / 50% / 100% 可见率，drawArgs 与 compaction mapping 均正确。');
+  } finally {
+    cdp?.close();
+    if (chrome) terminateChild(chrome.child);
+    terminateChild(vite);
+    await sleep(300);
+    if (chrome) {
+      try {
+        rmSync(chrome.userDataDir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 // ─── 比较 ───────────────────────────────────────────────────
 
 function gridDelta(a, b) {
@@ -415,7 +479,7 @@ const watchdog = setTimeout(() => {
 }, 45 * 60 * 1000);
 watchdog.unref?.();
 
-main()
+(CULLING_MATRIX ? runCullingMatrixMain() : main())
   .catch((e) => {
     console.error(e);
     process.exitCode = 1;

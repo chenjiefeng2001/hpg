@@ -7,7 +7,7 @@
  * 热路径零堆分配（实例存储与排序 scratch 均为复用数组）。
  */
 
-import type { Geometry, GlobalBinding, PipelineDesc, RenderItem, RenderStats, ResolvedPipeline } from '../types';
+import type { CullingDebugResult, Geometry, GlobalBinding, PipelineDesc, RenderItem, RenderStats, ResolvedPipeline } from '../types';
 import { PipelineCache } from './pipeline-cache';
 import { GeometryArena } from './geometry';
 import { RingBuffer, RING_ALIGN } from './ringbuffer';
@@ -43,6 +43,17 @@ export interface RendererDescriptor extends RendererOptions {
   device: GPUDevice;
   context: GPUCanvasContext;
   format: GPUTextureFormat;
+}
+
+interface CullingDebugSnapshot {
+  drawArgsBuffer: GPUBuffer;
+  drawArgsCount: number;
+  compactedIndicesBuffer: GPUBuffer;
+  compactedIndicesByteLength: number;
+  compactedSlotCount: number;
+  slotBases: Uint32Array;
+  candidateCounts: Uint32Array;
+  totalCandidateInstances: number;
 }
 
 const DEFAULT_CLEAR: [number, number, number, number] = [0.05, 0.06, 0.09, 1];
@@ -190,6 +201,7 @@ export class Renderer {
 
   // GPU Culling 相关。
   private _culling: CullingPipeline | null = null;
+  private _cullingSnapshot: CullingDebugSnapshot | null = null;
 
   // GPU 时间戳查询（按需创建）。
   private _timestamps: TimestampQuery | null = null;
@@ -1022,7 +1034,15 @@ export class Renderer {
 
      if (!this._culling) this._culling = new CullingPipeline(this.device);
     const encoder = this.device.createCommandEncoder({ label: `${this.label}:frame-culled` });
-    const { drawArgsBuffer, compactedIndicesBuffer, slotBases, maxSlotBytes } = this._culling.cull(
+    const {
+      drawArgsBuffer,
+      compactedIndicesBuffer,
+      drawArgsCount,
+      slotBases,
+      candidateCounts,
+      compactedSlotCount,
+      maxSlotBytes,
+    } = this._culling.cull(
       vpMatrix,
       spheresData,
       geometryIds,
@@ -1122,11 +1142,105 @@ export class Renderer {
     if (timestamps) timestamps.resolve(encoder);
 
       this.device.queue.submit([encoder.finish()]);
+    const snapshot = this._cullingSnapshot;
+    if (snapshot) {
+      snapshot.drawArgsBuffer = drawArgsBuffer;
+      snapshot.drawArgsCount = drawArgsCount;
+      snapshot.compactedIndicesBuffer = compactedIndicesBuffer;
+      snapshot.compactedIndicesByteLength = compactedIndicesBuffer.size;
+      snapshot.compactedSlotCount = compactedSlotCount;
+      snapshot.slotBases = slotBases;
+      snapshot.candidateCounts = candidateCounts;
+      snapshot.totalCandidateInstances = totalInstances;
+    } else {
+      this._cullingSnapshot = {
+        drawArgsBuffer,
+        drawArgsCount,
+        compactedIndicesBuffer,
+        compactedIndicesByteLength: compactedIndicesBuffer.size,
+        compactedSlotCount,
+        slotBases,
+        candidateCounts,
+        totalCandidateInstances: totalInstances,
+      };
+    }
       return stats;
     } finally {
        this.ring.endFrame();
      }
    }
+
+  async readCullingDebug(device: GPUDevice): Promise<CullingDebugResult> {
+    this.assertUsable('readCullingDebug');
+    if (!device || device !== this.device) {
+      throw new Error('[hpg] readCullingDebug() requires the device used to create this Renderer.');
+    }
+    const snapshot = this._cullingSnapshot;
+    if (!snapshot) {
+      throw new Error('[hpg] readCullingDebug() requires a prior successful submitCulled() call.');
+    }
+
+    const drawArgsBuffer = snapshot.drawArgsBuffer;
+    const drawArgsCount = snapshot.drawArgsCount;
+    const compactedIndicesBuffer = snapshot.compactedIndicesBuffer;
+    const compactedByteLength = snapshot.compactedIndicesByteLength;
+    const compactedSlotCount = snapshot.compactedSlotCount;
+    const slotBases = snapshot.slotBases;
+    const candidateCounts = snapshot.candidateCounts;
+    const totalCandidateInstances = snapshot.totalCandidateInstances;
+    const drawArgsByteLength = drawArgsCount * 20;
+    const totalByteLength = drawArgsByteLength + compactedByteLength;
+    let stagingBuffer: GPUBuffer | null = null;
+    let mapped = false;
+    try {
+      stagingBuffer = device.createBuffer({
+        label: `${this.label}:culling-debug-staging`,
+        size: Math.max(totalByteLength, 4),
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      const encoder = device.createCommandEncoder({ label: `${this.label}:culling-debug-copy` });
+      if (drawArgsByteLength > 0) {
+        encoder.copyBufferToBuffer(drawArgsBuffer, 0, stagingBuffer, 0, drawArgsByteLength);
+      }
+      if (compactedByteLength > 0) {
+        encoder.copyBufferToBuffer(
+          compactedIndicesBuffer,
+          0,
+          stagingBuffer,
+          drawArgsByteLength,
+          compactedByteLength,
+        );
+      }
+      device.queue.submit([encoder.finish()]);
+      await stagingBuffer.mapAsync(GPUMapMode.READ);
+      mapped = true;
+      const mappedRange = stagingBuffer.getMappedRange();
+      const drawArgs = new Uint32Array(mappedRange.slice(0, drawArgsByteLength));
+      const compactedIndices = new Uint32Array(
+        mappedRange.slice(drawArgsByteLength, drawArgsByteLength + compactedByteLength),
+      );
+      return analyzeCullingDebug(
+        drawArgs,
+        compactedIndices,
+        drawArgsCount,
+        slotBases,
+        candidateCounts,
+        compactedSlotCount,
+        totalCandidateInstances,
+      );
+    } finally {
+      if (stagingBuffer) {
+        if (mapped) {
+          try {
+            stagingBuffer.unmap();
+          } catch {}
+        }
+        try {
+          stagingBuffer.destroy();
+        } catch {}
+      }
+    }
+  }
 
   private assemble(batches: Batch[], totalBytes: number): void {
     this.ensureStore(totalBytes);
@@ -1226,6 +1340,7 @@ export class Renderer {
       this.depthTexture = null;
     }
     this._culling?.dispose();
+    this._cullingSnapshot = null;
     this.arena.dispose();
     this.ring.dispose();
      this.compactionBG = null;
@@ -1233,6 +1348,74 @@ export class Renderer {
      this.globalBGs.clear();
      this.cache.clear();
    }
+}
+
+function analyzeCullingDebug(
+  drawArgs: Uint32Array,
+  compactedIndices: Uint32Array,
+  drawArgsCount: number,
+  slotBases: Uint32Array,
+  candidateCounts: Uint32Array,
+  compactedSlotCount: number,
+  totalCandidateInstances: number,
+): CullingDebugResult {
+  const visibleInstances = new Uint32Array(drawArgsCount);
+  const mappedInstances = new Uint32Array(drawArgsCount);
+  const outOfRangeIndices: number[] = [];
+  const duplicateIndices: number[] = [];
+  let mappingValid = drawArgs.length === drawArgsCount * 5;
+  let candidateTotal = 0;
+
+  for (let g = 0; g < drawArgsCount; g++) {
+    const slotBase = slotBases[g];
+    const nextSlotBase = g + 1 < drawArgsCount ? slotBases[g + 1] : compactedSlotCount;
+    const candidateCount = candidateCounts[g] ?? 0;
+    const instanceCount = drawArgs[g * 5 + 1] ?? 0;
+    candidateTotal += candidateCount;
+    visibleInstances[g] = instanceCount;
+
+    if (
+      slotBase === undefined ||
+      nextSlotBase === undefined ||
+      slotBase > nextSlotBase ||
+      nextSlotBase > compactedSlotCount ||
+      compactedSlotCount > compactedIndices.length
+    ) {
+      mappingValid = false;
+      continue;
+    }
+
+    const availableSlots = nextSlotBase - slotBase;
+    if (instanceCount > availableSlots || instanceCount > candidateCount) mappingValid = false;
+    const seen = new Set<number>();
+    const scanCount = Math.min(instanceCount, availableSlots);
+    for (let slot = 0; slot < scanCount; slot++) {
+      const index = compactedIndices[slotBase + slot] as number;
+      if (index >= candidateCount) {
+        outOfRangeIndices.push(index);
+        continue;
+      }
+      if (seen.has(index)) {
+        duplicateIndices.push(index);
+      } else {
+        seen.add(index);
+      }
+      mappedInstances[g]++;
+    }
+    if (mappedInstances[g] !== instanceCount) mappingValid = false;
+  }
+
+  if (candidateTotal !== totalCandidateInstances) mappingValid = false;
+  if (outOfRangeIndices.length > 0 || duplicateIndices.length > 0) mappingValid = false;
+  return {
+    drawArgs,
+    compactedIndices,
+    visibleInstances,
+    mappedInstances,
+    outOfRangeIndices: Uint32Array.from(outOfRangeIndices),
+    duplicateIndices: Uint32Array.from(duplicateIndices),
+    mappingValid,
+  };
 }
 
 /** 夹到 [0, 1]。 */

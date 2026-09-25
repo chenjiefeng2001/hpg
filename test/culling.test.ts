@@ -3,12 +3,17 @@ import { CullingPipeline } from '../src/core/culling';
 import { CS_FRUSTUM_CULL } from '../src/shaders/culling';
 
 function fakeDevice(): GPUDevice {
-  const buffers: { size: number; destroyed: boolean }[] = [];
+  const buffers: { size: number; destroyed: boolean; usage: number; label: string }[] = [];
   const submitted: GPUCommandBuffer[][] = [];
 
   return {
     createBuffer(desc: GPUBufferDescriptor) {
-      const buf = { size: desc.size as number, destroyed: false };
+      const buf = {
+        size: desc.size as number,
+        destroyed: false,
+        usage: desc.usage as number,
+        label: desc.label ?? '',
+      };
       buffers.push(buf);
       return buf as unknown as GPUBuffer;
     },
@@ -136,6 +141,25 @@ describe('CullingPipeline', () => {
     expect(result.drawArgsCount).toBe(1);
     expect(result.drawArgsBuffer).toBeDefined();
     expect(result.compactedIndicesBuffer).toBeDefined();
+  });
+
+  it('cull() marks only readback sources with COPY_SRC', () => {
+    const device = fakeDevice();
+    const culling = new CullingPipeline(device);
+    const vp = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+
+    runCull(culling, vp, new Float32Array([0, 0, 0, 0]), new Uint32Array([0]), 1);
+
+    const buffers = (device as unknown as {
+      _buffers: { label: string; usage: number }[];
+    })._buffers;
+    const drawArgs = buffers.find((buffer) => buffer.label === 'hpg:cull-draw-args')!;
+    const compacted = buffers.find((buffer) => buffer.label === 'hpg:cull-compacted')!;
+    expect(drawArgs.usage & GPUBufferUsage.COPY_SRC).toBe(GPUBufferUsage.COPY_SRC);
+    expect(compacted.usage & GPUBufferUsage.COPY_SRC).toBe(GPUBufferUsage.COPY_SRC);
+    for (const label of ['hpg:cull-spheres', 'hpg:cull-geo-indices', 'hpg:cull-geo-bases', 'hpg:cull-compaction-counters']) {
+      expect(buffers.find((buffer) => buffer.label === label)!.usage & GPUBufferUsage.COPY_SRC).toBe(0);
+    }
   });
 
   it('cull() handles zero spheres', () => {

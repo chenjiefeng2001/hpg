@@ -65,6 +65,8 @@ jobs:
         run: |
           if [ -n "$FILTER" ]; then
             npm run verify:browser -- "$FILTER"
-          else
-            npm run verify:browser
-          fi
+           else
+             npm run verify:browser
+           fi
+      - name: Run GPU culling correctness matrix
+        run: npm run verify:culling-matrix

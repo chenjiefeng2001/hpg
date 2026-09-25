@@ -76,9 +76,10 @@ Frozen verification is a historical, reproducible baseline snapshot:
 
 ```text
 npm run typecheck      0 error
-npm test               19 files / 279 passed
+npm test               19 files / 282 passed
 npm run audit          parse ok 23/23 · BROKEN = 0
 npm run verify:browser 23/23 · validation errors 0 · Direct/Culled brightness-grid parity
+npm run verify:culling-matrix 0% / 10% / 50% / 100% · drawArgs + mapping valid
 npm run build          dist/lib/index.js + declarations + source maps
 npm run build:demo     all five page entries emitted
 ```

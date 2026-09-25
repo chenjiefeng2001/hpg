@@ -188,9 +188,9 @@ export class CullingPipeline {
     this._buffers = {
       spheres: createBuf(instanceCount * BYTES_PER_SPHERE, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, 'spheres'),
       geometryIndices: createBuf(instanceCount * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, 'geo-indices'),
-      compactedIndices: createBuf(slotCount * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, 'compacted'),
+      compactedIndices: createBuf(slotCount * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, 'compacted'),
       geometryBases: createBuf(geometryCount * 8, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, 'geo-bases'),
-      drawArgs: createBuf(geometryCount * 20, GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST, 'draw-args'),
+      drawArgs: createBuf(geometryCount * 20, GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, 'draw-args'),
       compactionCounters: createBuf(geometryCount * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, 'compaction-counters'),
       uniforms: createBuf(UNIFORM_SIZE, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, 'uniforms'),
     };
@@ -250,6 +250,8 @@ export class CullingPipeline {
     drawArgsCount: number;
     /** 每个 geometry 在 compactedIndices 中的起始元素下标（256 字节对齐）。 */
     slotBases: Uint32Array;
+    candidateCounts: Uint32Array;
+    compactedSlotCount: number;
     /** compactedIndices 的绑定尺寸（字节）= 单个 geometry 的最大 slot 区。 */
     maxSlotBytes: number;
   } {
@@ -361,6 +363,8 @@ export class CullingPipeline {
       compactedIndicesBuffer: bufs.compactedIndices,
       drawArgsCount: geometryCount,
       slotBases,
+      candidateCounts: counts,
+      compactedSlotCount: slotCount,
       maxSlotBytes: Math.max(headroom * 4, SLOT_ALIGN * 4),
     };
   }

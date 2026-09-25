@@ -56,6 +56,125 @@ function makeRenderer() {
   return { device, context, recorded, renderer };
 }
 
+interface ReadbackBufferInfo {
+  buffer: GPUBuffer;
+  label: string;
+  usage: number;
+  bytes: Uint8Array;
+  mapCount: number;
+  unmapCount: number;
+  destroyed: boolean;
+}
+
+function installCullingReadbackFake(device: GPUDevice) {
+  const buffers = new Map<GPUBuffer, ReadbackBufferInfo>();
+  const copies: {
+    source: GPUBuffer;
+    sourceOffset: number;
+    destination: GPUBuffer;
+    destinationOffset: number;
+    size: number;
+  }[] = [];
+  const patchedEncoders = new WeakSet<object>();
+  let failNextMapRead = false;
+  const createBuffer = device.createBuffer.bind(device);
+  const writeBuffer = device.queue.writeBuffer.bind(device.queue);
+  const createCommandEncoder = device.createCommandEncoder.bind(device);
+
+  device.createBuffer = ((descriptor: GPUBufferDescriptor) => {
+    const buffer = createBuffer(descriptor);
+    const info: ReadbackBufferInfo = {
+      buffer,
+      label: descriptor.label ?? '',
+      usage: descriptor.usage,
+      bytes: new Uint8Array(descriptor.size),
+      mapCount: 0,
+      unmapCount: 0,
+      destroyed: false,
+    };
+    buffers.set(buffer, info);
+    if ((descriptor.usage & GPUBufferUsage.MAP_READ) !== 0) {
+      Object.assign(buffer, {
+        mapAsync: async () => {
+          info.mapCount++;
+        },
+        getMappedRange: () => {
+          if (failNextMapRead) {
+            failNextMapRead = false;
+            throw new Error('injected mapped-range failure');
+          }
+          return info.bytes.buffer as ArrayBuffer;
+        },
+        unmap: () => {
+          info.unmapCount++;
+        },
+        destroy: () => {
+          info.destroyed = true;
+        },
+      });
+    }
+    return buffer;
+  }) as typeof device.createBuffer;
+
+  device.queue.writeBuffer = ((
+    buffer: GPUBuffer,
+    bufferOffset: number,
+    data: ArrayBuffer | ArrayBufferView,
+    dataOffset?: number,
+    size?: number,
+  ) => {
+    writeBuffer(buffer, bufferOffset, data, dataOffset, size);
+    const info = buffers.get(buffer);
+    if (!info) return;
+    const source = ArrayBuffer.isView(data)
+      ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+      : new Uint8Array(data);
+    const from = dataOffset ?? 0;
+    info.bytes.set(source.subarray(from, from + (size ?? source.byteLength - from)), bufferOffset);
+  }) as typeof device.queue.writeBuffer;
+
+  device.createCommandEncoder = ((descriptor?: GPUCommandEncoderDescriptor) => {
+    const encoder = createCommandEncoder(descriptor);
+    if (!patchedEncoders.has(encoder as unknown as object)) {
+      const copyBufferToBuffer = encoder.copyBufferToBuffer.bind(encoder);
+      encoder.copyBufferToBuffer = ((
+        source: GPUBuffer,
+        sourceOffset: number,
+        destination: GPUBuffer,
+        destinationOffset: number,
+        size: number,
+      ) => {
+        copies.push({ source, sourceOffset, destination, destinationOffset, size });
+        const sourceInfo = buffers.get(source);
+        const destinationInfo = buffers.get(destination);
+        if (sourceInfo && destinationInfo) {
+          destinationInfo.bytes.set(
+            sourceInfo.bytes.subarray(sourceOffset, sourceOffset + size),
+            destinationOffset,
+          );
+        }
+        copyBufferToBuffer(source, sourceOffset, destination, destinationOffset, size);
+      }) as typeof encoder.copyBufferToBuffer;
+      patchedEncoders.add(encoder as unknown as object);
+    }
+    return encoder;
+  }) as typeof device.createCommandEncoder;
+
+  return {
+    copies,
+    find: (label: string) => Array.from(buffers.values()).find((buffer) => buffer.label === label),
+    stagingBuffers: () => Array.from(buffers.values()).filter((buffer) => (buffer.usage & GPUBufferUsage.MAP_READ) !== 0),
+    writeU32(label: string, elementOffset: number, values: readonly number[]) {
+      const info = Array.from(buffers.values()).find((buffer) => buffer.label === label);
+      if (!info) throw new Error(`Missing fake buffer ${label}`);
+      new Uint32Array(info.bytes.buffer, elementOffset * 4, values.length).set(values);
+    },
+    failNextMapRead() {
+      failNextMapRead = true;
+    },
+  };
+}
+
 function customInstanceLayoutShader(base: string): string {
   const marker = `struct InstanceData {
     modelMatrix: mat4x4<f32>,
@@ -680,6 +799,80 @@ describe('submitCulled 分组与 draw args', () => {
     const a = registerPipeline(renderer, { label: 'same' });
     const b = registerPipeline(renderer, { label: 'same', compaction: true });
     expect(a.id).not.toBe(b.id);
+    renderer.dispose();
+  });
+
+  it('readCullingDebug rejects without a snapshot and after dispose', async () => {
+    const { renderer, device } = makeRenderer();
+    await expect(renderer.readCullingDebug(device)).rejects.toThrow(/prior successful submitCulled/);
+    renderer.dispose();
+    await expect(renderer.readCullingDebug(device)).rejects.toThrow(/dispose/);
+  });
+
+  it('readCullingDebug copies, maps, validates, and destroys its staging buffer', async () => {
+    const { device, context, recorded } = createFakeGPU();
+    const fake = installCullingReadbackFake(device);
+    const renderer = Renderer.create({ device, context, format: FORMAT });
+    const pipeline = registerPipeline(renderer, { compaction: true });
+    const geometries = [cubeGeometry(renderer.geometryArena), cubeGeometry(renderer.geometryArena, 2)];
+    const vp = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+
+    renderer.submitCulled([
+      { geometry: geometries[0]!, pipeline, instanceCount: 3 },
+      { geometry: geometries[1]!, pipeline, instanceCount: 2 },
+    ], vp);
+
+    expect(fake.stagingBuffers()).toHaveLength(0);
+    expect(recorded.submits).toBe(1);
+
+    const drawArgsBuffer = fake.find('hpg:cull-draw-args')!;
+    const compactedBuffer = fake.find('hpg:cull-compacted')!;
+    expect(drawArgsBuffer.usage & GPUBufferUsage.COPY_SRC).toBe(GPUBufferUsage.COPY_SRC);
+    expect(compactedBuffer.usage & GPUBufferUsage.COPY_SRC).toBe(GPUBufferUsage.COPY_SRC);
+    fake.writeU32('hpg:cull-draw-args', 0, [12, 2, 0, 0, 0, 36, 1, 0, 0, 0]);
+    fake.writeU32('hpg:cull-compacted', 0, [0, 2]);
+    fake.writeU32('hpg:cull-compacted', 64, [0]);
+
+    const valid = await renderer.readCullingDebug(device);
+    expect(valid.drawArgs).toBeInstanceOf(Uint32Array);
+    expect(Array.from(valid.drawArgs.slice(0, 10))).toEqual([12, 2, 0, 0, 0, 36, 1, 0, 0, 0]);
+    expect(valid.compactedIndices).toHaveLength(compactedBuffer.bytes.byteLength / 4);
+    expect(Array.from(valid.visibleInstances)).toEqual([2, 1]);
+    expect(Array.from(valid.mappedInstances)).toEqual([2, 1]);
+    expect(Array.from(valid.outOfRangeIndices)).toEqual([]);
+    expect(Array.from(valid.duplicateIndices)).toEqual([]);
+    expect(valid.mappingValid).toBe(true);
+
+    expect(fake.copies).toHaveLength(2);
+    expect(fake.copies[0]!.source).toBe(drawArgsBuffer.buffer);
+    expect(fake.copies[0]).toMatchObject({ sourceOffset: 0, destinationOffset: 0, size: 40 });
+    expect(fake.copies[1]!.source).toBe(compactedBuffer.buffer);
+    expect(fake.copies[1]).toMatchObject({
+      sourceOffset: 0,
+      destinationOffset: 40,
+      size: compactedBuffer.bytes.byteLength,
+    });
+    const staging = fake.stagingBuffers()[0]!;
+    expect(staging.usage & GPUBufferUsage.COPY_DST).toBe(GPUBufferUsage.COPY_DST);
+    expect(staging.usage & GPUBufferUsage.MAP_READ).toBe(GPUBufferUsage.MAP_READ);
+    expect(staging.bytes.byteLength).toBe(40 + compactedBuffer.bytes.byteLength);
+    expect(staging).toMatchObject({ mapCount: 1, unmapCount: 1, destroyed: true });
+
+    fake.writeU32('hpg:cull-draw-args', 0, [12, 3, 0, 0, 0, 36, 1, 0, 0, 0]);
+    fake.writeU32('hpg:cull-compacted', 0, [0, 3, 0]);
+    const invalid = await renderer.readCullingDebug(device);
+    expect(invalid.mappingValid).toBe(false);
+    expect(Array.from(invalid.visibleInstances)).toEqual([3, 1]);
+    expect(Array.from(invalid.mappedInstances)).toEqual([2, 1]);
+    expect(Array.from(invalid.outOfRangeIndices)).toEqual([3]);
+    expect(Array.from(invalid.duplicateIndices)).toEqual([0]);
+    expect(Array.from(valid.drawArgs.slice(0, 2))).toEqual([12, 2]);
+
+    fake.failNextMapRead();
+    await expect(renderer.readCullingDebug(device)).rejects.toThrow('injected mapped-range failure');
+    expect(fake.stagingBuffers()).toHaveLength(3);
+    expect(fake.stagingBuffers().every((buffer) => buffer.mapCount === 1 && buffer.unmapCount === 1 && buffer.destroyed)).toBe(true);
+
     renderer.dispose();
   });
 });

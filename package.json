@@ -27,6 +27,7 @@
     "bench": "vite --open /benchmark/",
     "audit": "vite-node benchmark/asset-compat-cli.ts",
     "verify:browser": "node benchmark/browser-material-check.mjs",
+    "verify:culling-matrix": "node benchmark/browser-material-check.mjs --culling-matrix",
     "build": "vite build && tsc -p tsconfig.build.json",
     "build:demo": "vite build --config vite.demo.config.ts",
     "test": "vitest run",

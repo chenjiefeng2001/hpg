@@ -9,7 +9,8 @@
 - 浏览器 gate 现在拒绝空像素/无 draw、无匹配资产，并在 GPU completion 后发布同帧像素结果；release/npm workflow 依赖同一浏览器 gate。
 - 增加 WebGPU adapter 快速预检、GLB reload generation、Geometry ownership/context device/shader layout 校验，并为 doubleSided 未实现语义发出 warning。
 - TimestampQuery 改用标准 WebGPU `timestampWrites` pass descriptor；geometry free-list 保留对齐 padding，未使用的 sparse accessor 不再阻断解析。
-- Node 回归：19 个文件、279 个测试；Chrome 23/23 模型通过，0 validation error，Direct/Culled 亮度网格近似一致。
+- Node 回归：19 个文件、282 个测试；Chrome 23/23 模型通过，0 validation error，Direct/Culled 亮度网格近似一致。
+- 新增 GPU culling correctness matrix：0%/10%/50%/100% 可见率，校验 indirect drawArgs 与 compaction mapping。
 
 ## 0.2.0 — 技术基线冻结（Baseline Freeze）
 
@@ -33,7 +34,7 @@ GPU culling、indirect execution、geometry management，以及经过真实 GLB 
 | Gate | 命令 | 结果 |
 |---|---|---|
 | 类型检查 | `npm run typecheck` | 0 error |
-| 回归测试 | `npm test` | 19 files / 279 passed |
+| 回归测试 | `npm test` | 19 files / 282 passed |
 | 真实资产审计 | `npm run audit` | parse ok 23/23、BROKEN（静默错误数据）= 0 |
 | 真实 Chrome + WebGPU | `npm run verify:browser` | 23/23：validation error = 0、贴图跳过 = 0、Direct/Culled 亮度网格近似一致 |
 | 库构建 | `npm run build` | `dist/lib/index.js`、`.d.ts` 与 sourcemap 产出；大小是一次工具链快照 |
@@ -52,7 +53,7 @@ Known contract violations: 0 within the documented narrow execution scope
 **历史测试数 236 → 230**：删除 3 个只有 `console.log`、零断言的临时审计探针
 （`test/tmp-audit.test.ts`、`test/tmp-audit2.test.ts`、`test/tmp-dbg.test.ts` ——
 Phase 12 的脚手架，对应 6 个伪用例）。它们观察的不变量已由
-`test/render-chain.test.ts` / `test/geometry.test.ts` 的断言覆盖；当前 Unreleased 基线为 279。
+`test/render-chain.test.ts` / `test/geometry.test.ts` 的断言覆盖；当前 Unreleased 基线为 282。
 
 ### 阶段一 hardening
 
@@ -61,7 +62,7 @@ Phase 12 的脚手架，对应 6 个伪用例）。它们观察的不变量已�
 - `submitCulled()` 强制要求 compaction pipeline，culling 测试使用 `VS_INSTANCED_COMPACTION`。
 - 包围球使用覆盖 shear 的保守矩阵范数，并增加 RenderItem、管线和 geometry primitive 校验。
 - 新增独立的手动 `browser-gate.yml`，将真实 Chrome/WebGPU 验证与普通 Node CI 分离。
-- 新增 32 个回归测试；当前测试总数为 19 个文件、279 个测试。
+- 新增 32 个回归测试；当前测试总数为 19 个文件、282 个测试。
 
 ### 消费者验证（clean install / consumer test）
 

@@ -18,6 +18,7 @@
 
 import { Renderer, uniformBindGroupLayout } from '../src/core/renderer';
 import { VS_INSTANCED, VS_INSTANCED_COMPACTION, FS_COLOR } from '../src/shaders/instance';
+import { extractFrustumPlanes, sphereInFrustum } from '../src/core/culling';
 import { TimestampQuery } from '../src/core/timestamp';
 import { identity } from '../src/core/math';
 import type { GlobalBinding, RenderItem, BoundingSphere, ResolvedPipeline } from '../src/types';
@@ -140,10 +141,10 @@ function makeVP(): Float32Array {
   const out = new Float32Array(16);
   out[0] = 2 / (r - l);
   out[5] = 2 / (t - b);
-  out[10] = -f / (f - n);
+  out[10] = -1 / (f - n);
   out[12] = -(r + l) / (r - l);
   out[13] = -(t + b) / (t - b);
-  out[14] = -(f * n) / (f - n);
+  out[14] = -n / (f - n);
   out[15] = 1;
   return out;
 }
@@ -377,6 +378,73 @@ function buildCases(): BenchCase[] {
   return cases;
 }
 
+interface CullingMatrixResult {
+  ratio: number;
+  expectedVisible: number;
+  actualVisible: number;
+  expectedByGeometry: number[];
+  actualByGeometry: number[];
+  mappingValid: boolean;
+  outOfRange: number[];
+  duplicates: number[];
+  ok: boolean;
+}
+
+async function runCullingMatrix(
+  renderer: Renderer,
+  pipeline: ResolvedPipeline,
+  geometryA: ReturnType<Renderer['createGeometry']>,
+  geometryB: ReturnType<Renderer['createGeometry']>,
+  vpMatrix: Float32Array,
+): Promise<CullingMatrixResult[]> {
+  const planes = extractFrustumPlanes(vpMatrix);
+  const count = 1000;
+  const split = count / 2;
+  const results: CullingMatrixResult[] = [];
+
+  for (const ratio of [0, 0.1, 0.5, 1]) {
+    const scene = generateGrid(count, ratio);
+    const items: RenderItem[] = scene.map((entry, index) => {
+      const transform = identity();
+      transform[12] = entry.x;
+      transform[13] = entry.y;
+      transform[14] = entry.z;
+      return {
+        geometry: index < split ? geometryA : geometryB,
+        pipeline,
+        transforms: transform,
+        instanceData: entry.color,
+        bounding: entry.bounding,
+      };
+    });
+    renderer.submitCulled(items, vpMatrix);
+    const debug = await renderer.readCullingDebug(renderer.device);
+    const expectedByGeometry = [0, 0];
+    for (let i = 0; i < scene.length; i++) {
+      if (sphereInFrustum(planes, scene[i]!.bounding.centerX, scene[i]!.bounding.centerY, scene[i]!.bounding.centerZ, scene[i]!.bounding.radius)) {
+        expectedByGeometry[i < split ? 0 : 1]++;
+      }
+    }
+    const actualByGeometry = Array.from(debug.visibleInstances);
+    const expectedVisible = expectedByGeometry.reduce((a, b) => a + b, 0);
+    const actualVisible = actualByGeometry.reduce((a, b) => a + b, 0);
+    const outOfRange = Array.from(debug.outOfRangeIndices);
+    const duplicates = Array.from(debug.duplicateIndices);
+    results.push({
+      ratio,
+      expectedVisible,
+      actualVisible,
+      expectedByGeometry,
+      actualByGeometry,
+      mappingValid: debug.mappingValid,
+      outOfRange,
+      duplicates,
+      ok: debug.mappingValid && actualVisible === expectedVisible && actualByGeometry.every((value, i) => value === expectedByGeometry[i]) && outOfRange.length === 0 && duplicates.length === 0,
+    });
+  }
+  return results;
+}
+
 // ─── Init ────────────────────────────────────────────────────
 
 async function main() {
@@ -470,8 +538,29 @@ async function main() {
     }],
     indices,
   );
+  const geometryB = renderer.createGeometry(
+    vertices,
+    [{
+      arrayStride: 24,
+      stepMode: 'vertex',
+      attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x3' },
+        { shaderLocation: 1, offset: 12, format: 'float32x3' },
+      ],
+    }],
+    indices,
+  );
 
   const vpMatrix = makeVP();
+  if (new URLSearchParams(location.search).has('matrix')) {
+    output.textContent = 'Running GPU culling correctness matrix…';
+    const results = await runCullingMatrix(renderer, culledPipeline, geometry, geometryB, vpMatrix);
+    const matrix = { results, ok: results.every((result) => result.ok) };
+    (window as unknown as Record<string, unknown>).__hpgCullingMatrix = matrix;
+    output.textContent = JSON.stringify(matrix, null, 2);
+    renderer.dispose();
+    return;
+  }
   const cases = buildCases();
 
   // Group cases by (count, visibility) to avoid regenerating scenes.

@@ -9,7 +9,7 @@
 评估依据：
 
 - 当前源代码和公开 API
-- 19 个测试文件、279 个测试（本轮 hardening 新增回归覆盖）
+- 19 个测试文件、282 个测试（本轮 hardening 新增回归覆盖）
 - 23 个真实 GLB 资产回归
 - Chrome/Dawn 本地浏览器验证记录
 - GitHub Actions 的 clean-checkout 门禁
@@ -80,7 +80,7 @@ RenderItem[]
 
 ```text
 19 test files passed
-279 tests passed
+282 tests passed
 ```
 
 已覆盖的执行不变量包括：
@@ -402,10 +402,11 @@ workflow：
 当前验证：
 
 ```text
-19 test files / 279 tests passed
+19 test files / 282 tests passed
 23/23 GLB audit: parse ok, BROKEN = 0
 Chrome 23/23: validation error = 0, texture skipped = 0,
 Direct/Culled brightness-grid parity = 0
+GPU culling matrix: 0% / 10% / 50% / 100%, mapping valid = true
 ```
 
 仍不能由本轮静态/本地证据关闭的事项：
@@ -414,5 +415,5 @@ Direct/Culled brightness-grid parity = 0
 - 用户自定义 dynamic group layout、多 vertex slot、完整 PBR、mipmap 链、alpha BLEND、double-sided 执行语义仍未实现（double-sided 已有显式 warning）。
 - `FS_DEPTH_ONLY` 仍不是无 color output 的真正 depth-only pipeline；该 API 需要单独的多 attachment 设计。
 - culling timestamp 目前只覆盖 render pass，不能代表完整 compute+render GPU 成本。
-- 0%/部分可见 culling 的真实 GPU mapping、device lost、长时间资源压力、跨设备和跨浏览器矩阵仍需要专门 workload。
+- 当前已验证合成 workload 的 0%/10%/50%/100% GPU culling mapping；更复杂的多材质/大规模 culling、device lost、长时间资源压力、跨设备和跨浏览器矩阵仍需要专门 workload。
 - hosted runner 是否提供 WebGPU 取决于环境；browser gate 现在会让发布 fail closed，而不是静默跳过。

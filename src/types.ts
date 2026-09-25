@@ -162,3 +162,13 @@ export interface RenderStats {
   batches: number;
   pipelinesUsed: number;
 }
+
+export interface CullingDebugResult {
+  drawArgs: Uint32Array;
+  compactedIndices: Uint32Array;
+  visibleInstances: Uint32Array;
+  mappedInstances: Uint32Array;
+  outOfRangeIndices: Uint32Array;
+  duplicateIndices: Uint32Array;
+  mappingValid: boolean;
+}
