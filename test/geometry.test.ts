@@ -58,6 +58,26 @@ describe('GeometryArena', () => {
     expect(geo.indexSlice!.byteLength % 4).toBe(0);
   });
 
+  it('重复 create/destroy 保持 live geometry 为零且复用同一 pool', () => {
+    const arena = new GeometryArena(fakeDevice());
+    const layout: VertexLayoutDesc[] = [{
+      arrayStride: 24,
+      stepMode: 'vertex',
+      attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' as GPUVertexFormat }],
+    }];
+    const vertices = new Float32Array(18);
+    for (let i = 0; i < 100; i++) {
+      const geometry = arena.createGeometry(vertices, layout);
+      arena.destroyGeometry(geometry);
+    }
+    const stats = arena.stats();
+    expect(stats.geometries).toBe(0);
+    expect(stats.vertexPools).toBe(1);
+    expect(stats.vertexFreeBytes).toBe(80);
+    expect(stats.vertexUsedBytes).toBe(80);
+    arena.dispose();
+  });
+
   it('回收非 16 对齐的 vertex payload 时保留 allocation padding', () => {
     const arena = new GeometryArena(fakeDevice());
     const layout: VertexLayoutDesc[] = [{

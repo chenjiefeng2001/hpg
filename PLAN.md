@@ -778,7 +778,7 @@ GLB / Material / Texture 的作用是**给 hpg 喂越来越真实的 Render Work
 
 ### 结论：execution boundary 没有「已被证据证明」的功能性缺失
 
-23/23 真实资产、当前 hardening 282 个回归、Direct/Culled 亮度网格近似一致、零 validation error ——
+23/23 真实资产、当前 hardening 284 个回归、Direct/Culled 亮度网格近似一致、零 validation error ——
 **目前没有任何证据**说明主链（RenderItem → submission → batching → indirect → culling）
 缺能力或需要重新设计。
 
@@ -831,14 +831,15 @@ instrumentation capability，不作为功能开发前置条件。
 | Gate | 命令 | 结果 |
 | --- | --- | --- |
 | 类型检查 | `npm run typecheck` | 0 error |
-| 全量回归 | `npm test` | 19 files / 230 passed（冻结时历史记录；当前 hardening 为 282） |
+| 全量回归 | `npm test` | 19 files / 230 passed（冻结时历史记录；当前 hardening 为 284） |
 | 真实资产审计 | `npm run audit` | parse ok 23/23、BROKEN（静默错误数据）= 0 |
 | 真实 Chrome + WebGPU | `npm run verify:browser` | 23/23：validation error = 0、贴图跳过 = 0、Direct/Culled 亮度网格近似一致 |
 | GPU culling 矩阵 | `npm run verify:culling-matrix` | 0% / 10% / 50% / 100%：多 geometry/material 的 drawArgs、mapping、范围/重复校验通过 |
+| 资源/设备生命周期 | `test/geometry.test.ts`、`test/renderer.test.ts` | repeated create/destroy、device lost 后显式拒绝提交 |
 | 库构建 | `npm run build` | `dist/lib/index.js`、`.d.ts` 与 sourcemap 产出；大小是一次工具链快照 |
 | Demo 构建 | `npm run build:demo` | 多页面入口全部产出（index / phase5 / glb-viewer / benchmark / glb-bench） |
 
-上表是冻结时的历史验证记录。当前 hardening 重新执行了 282 个 Node 测试、23/23 Chrome gate 和 GPU culling 矩阵；
+上表是冻结时的历史验证记录。当前 hardening 重新执行了 284 个 Node 测试、23/23 Chrome gate 和 GPU culling 矩阵；
 GitHub Actions 自动执行可复现的 Node、资产、构建、打包和消费者检查，release/publish 依赖 browser gate。
 Release workflow 创建 GitHub Release，不执行 npm registry publish。
 

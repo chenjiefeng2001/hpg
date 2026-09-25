@@ -76,7 +76,7 @@ Frozen verification is a historical, reproducible baseline snapshot:
 
 ```text
 npm run typecheck      0 error
-npm test               19 files / 282 passed
+npm test               19 files / 284 passed
 npm run audit          parse ok 23/23 · BROKEN = 0
 npm run verify:browser 23/23 · validation errors 0 · Direct/Culled brightness-grid parity
 npm run verify:culling-matrix 0% / 10% / 50% / 100% · multi-geometry/material drawArgs + mapping valid
@@ -184,6 +184,7 @@ grouped per geometry — each geometry gets its own indirect draw args.
 | `renderer.geometryArena` | Geometry pool manager |
 | `renderer.createGeometry(vtx, layouts, idx?, indexFormat?, primitive?)` | Convenience wrapper over `geometryArena.createGeometry` |
 | `renderer.instanceBuffer` | Current transient instance buffer (diagnostics; rebuilt on growth) |
+| `renderer.deviceLost` / `deviceLostMessage` | Device-loss state and diagnostic message; new submissions fail explicitly |
 | `renderer.dispose()` | Release all GPU resources |
 
 ### Geometry

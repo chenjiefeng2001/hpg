@@ -9,8 +9,9 @@
 - 浏览器 gate 现在拒绝空像素/无 draw、无匹配资产，并在 GPU completion 后发布同帧像素结果；release/npm workflow 依赖同一浏览器 gate。
 - 增加 WebGPU adapter 快速预检、GLB reload generation、Geometry ownership/context device/shader layout 校验，并为 doubleSided 未实现语义发出 warning。
 - TimestampQuery 改用标准 WebGPU `timestampWrites` pass descriptor；geometry free-list 保留对齐 padding，未使用的 sparse accessor 不再阻断解析。
-- Node 回归：19 个文件、282 个测试；Chrome 23/23 模型通过，0 validation error，Direct/Culled 亮度网格近似一致。
+- Node 回归：19 个文件、284 个测试；Chrome 23/23 模型通过，0 validation error，Direct/Culled 亮度网格近似一致。
 - 新增 GPU culling correctness matrix：0%/10%/50%/100% 可见率，覆盖多 geometry/material，校验 indirect drawArgs 与 compaction mapping。
+- 增加 device lost 显式拒绝状态、Geometry 重复回收压力回归和生命周期诊断。
 
 ## 0.2.0 — 技术基线冻结（Baseline Freeze）
 

@@ -9,7 +9,7 @@
 评估依据：
 
 - 当前源代码和公开 API
-- 19 个测试文件、282 个测试（本轮 hardening 新增回归覆盖）
+- 19 个测试文件、284 个测试（本轮 hardening 新增回归覆盖）
 - 23 个真实 GLB 资产回归
 - Chrome/Dawn 本地浏览器验证记录
 - GitHub Actions 的 clean-checkout 门禁
@@ -80,7 +80,7 @@ RenderItem[]
 
 ```text
 19 test files passed
-282 tests passed
+284 tests passed
 ```
 
 已覆盖的执行不变量包括：
@@ -394,6 +394,7 @@ workflow：
 - Renderer 拒绝 target/depth format 不匹配、stencil/color depth format、未配置或跨 device 的 context；静态 global uniform binding 校验设备对齐、范围与 UNIFORM usage。
 - PipelineCache 使用设备隔离、对象身份和 descriptor snapshot；Renderer 按 pipeline 对象而非局部 numeric id 缓存和合批，并拒绝跨 Renderer pipeline。
 - Renderer 拒绝未由当前 arena 创建或已销毁的 Geometry；内置实例 shader 的布局契约按规范化 WGSL 校验，不能用注释绕过。
+- Renderer 监听 `device.lost`，进入显式 lost 状态后拒绝新的提交；Geometry 重复 create/destroy 保持 live count 与 pool 复用稳定。
 - glTF 严格校验 GLB/container/bufferView/accessor，拒绝 sparse accessor、截断数据和非法索引；primitive 未声明 material 时使用默认材质；缺失 NORMAL 时展开 flat normals。
 - 修复默认 UV 原点、共享 image 只上传一次、sRGB 选项、场景 reload 的 Geometry 回收、timestamp feature 检查和 benchmark transform 组合；reload generation 在异步文件读取前保留，避免旧请求覆盖新模型。
 - culling compute 与 render 使用同一 command encoder；GPU timestamp 通过标准 `timestampWrites` pass descriptor 注入；browser gate 先做 WebGPU adapter 快速预检，再拒绝空像素/无 draw/无资产/模式错误，并在同一提交队列的 GPU completion 后发布 harness 结果。
@@ -402,11 +403,12 @@ workflow：
 当前验证：
 
 ```text
-19 test files / 282 tests passed
+19 test files / 284 tests passed
 23/23 GLB audit: parse ok, BROKEN = 0
 Chrome 23/23: validation error = 0, texture skipped = 0,
 Direct/Culled brightness-grid parity = 0
 GPU culling matrix: 0% / 10% / 50% / 100%, multi-geometry/material mapping valid = true
+Resource lifecycle: repeated Geometry create/destroy reuses pool; device lost rejects new submit
 ```
 
 仍不能由本轮静态/本地证据关闭的事项：

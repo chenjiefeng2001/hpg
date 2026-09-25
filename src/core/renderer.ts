@@ -198,6 +198,8 @@ export class Renderer {
   private instanceStore = new Float32Array(0);
   private _pipelineSet = new Set<number>();
   private _disposed = false;
+  private _deviceLost = false;
+  private _deviceLostMessage: string | null = null;
 
   // GPU Culling 相关。
   private _culling: CullingPipeline | null = null;
@@ -250,6 +252,13 @@ export class Renderer {
       throw new Error(`Renderer depthFormat must be a depth-only format, received ${this.depthFormat}.`);
     }
     this.label = opts.label ?? 'hpg';
+    const lostPromise = (device as GPUDevice & { lost?: Promise<GPUDeviceLostInfo> }).lost;
+    if (lostPromise) {
+      void lostPromise.then((info) => {
+        this._deviceLost = true;
+        this._deviceLostMessage = info.message || info.reason;
+      });
+    }
 
     this.arena = new GeometryArena(device);
     this.ring = new RingBuffer(device, opts.maxRingBytes ?? 1 << 20);
@@ -348,8 +357,20 @@ export class Renderer {
   }
 
   /** dispose 之后调用任何提交入口都是编程错误，显式报错替代晦涩的空引用异常。 */
+  get deviceLost(): boolean {
+    return this._deviceLost;
+  }
+
+  get deviceLostMessage(): string | null {
+    return this._deviceLostMessage;
+  }
+
   private assertUsable(method: string): void {
     if (this._disposed) throw new Error(`[hpg] Renderer 已 dispose，${method}() 不可再用。`);
+    if (this._deviceLost) {
+      const detail = this._deviceLostMessage ? `: ${this._deviceLostMessage}` : '';
+      throw new Error(`[hpg] GPUDevice 已 lost，${method}() 不可再用${detail}`);
+    }
   }
 
   private assertPresentationFormat(method: string): void {

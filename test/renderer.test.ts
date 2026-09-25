@@ -270,6 +270,34 @@ describe('RenderItem 输入校验', () => {
   });
 });
 
+describe('Renderer device lifecycle', () => {
+  it('device lost 后显式拒绝新的提交', async () => {
+    const { device, context } = createFakeGPU();
+    let resolveLost!: (info: GPUDeviceLostInfo) => void;
+    const lost = new Promise<GPUDeviceLostInfo>((resolve) => { resolveLost = resolve; });
+    (device as unknown as { lost: Promise<GPUDeviceLostInfo> }).lost = lost;
+    const renderer = new Renderer(device, context, 'bgra8unorm');
+    const layout = uniformBindGroupLayout(device, [{ binding: 0, visibility: GPUShaderStage.VERTEX }]);
+    const uniform = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const pipeline = renderer.registerPipeline({
+      vsCode: VS_INSTANCED,
+      fsCode: FS_COLOR,
+      vertexLayouts: [{ arrayStride: 12, stepMode: 'vertex', attributes: [{ shaderLocation: 0, format: 'float32x3', offset: 0 }] }],
+      bindGroupLayouts: [layout],
+      globalBindings: [{ binding: 0, buffer: uniform }],
+      targets: [{ format: 'bgra8unorm' }],
+    });
+    const geometry = renderer.createGeometry(new Float32Array(9), [{ arrayStride: 12, stepMode: 'vertex', attributes: [{ shaderLocation: 0, format: 'float32x3', offset: 0 }] }]);
+    expect(renderer.deviceLost).toBe(false);
+    resolveLost({ reason: 'destroyed', message: 'test device lost' } as GPUDeviceLostInfo);
+    await Promise.resolve();
+    expect(renderer.deviceLost).toBe(true);
+    expect(renderer.deviceLostMessage).toBe('test device lost');
+    expect(() => renderer.submit([{ geometry, pipeline }])).toThrow(/GPUDevice 已 lost/);
+    renderer.dispose();
+  });
+});
+
 describe('Renderer dispose', () => {
   it('dispose does not throw and can be called twice', () => {
     const { renderer } = setup();
