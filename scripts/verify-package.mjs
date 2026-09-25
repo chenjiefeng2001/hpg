@@ -51,6 +51,10 @@ try {
     join(consumerDir, 'consumer.mjs'),
     [
       "import * as runtime from '@hpg/runtime';",
+      "for (const name of ['Renderer', 'GeometryArena', 'CullingPipeline', 'TimestampQuery', 'parseGltf', 'flattenScene', 'extractFrustumPlanes', 'sphereInFrustum', 'importGltfAsset', 'sceneToRenderItems', 'MaterialStore', 'VS_INSTANCED_COMPACTION']) {",
+      "  if (!(name in runtime)) throw new Error(`${name} export is missing`);",
+      '}',
+      "if (Object.keys(runtime).length !== 43) throw new Error(`expected 43 runtime exports, received ${Object.keys(runtime).length}`);",
       "if (typeof runtime.identity !== 'function') throw new Error('identity export is missing');",
       'console.log(`consumer import ok: ${Object.keys(runtime).length} exports`);',
     ].join('\n'),
@@ -58,9 +62,11 @@ try {
   writeFileSync(
     join(consumerDir, 'consumer.ts'),
     [
-      "import { identity } from '@hpg/runtime';",
+      "import { identity, type FlattenedNode, type SubmitOptions } from '@hpg/runtime';",
       'const matrix = identity();',
-      'void matrix;',
+      'const submitOptions: SubmitOptions = {};',
+      'const node: FlattenedNode = { name: "node", worldMatrix: matrix };',
+      'void matrix; void submitOptions; void node;',
     ].join('\n'),
   );
   writeFileSync(

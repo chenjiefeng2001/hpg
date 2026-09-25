@@ -26,7 +26,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  browser:
+    uses: ./.github/workflows/browser-gate.yml
+    with:
+      ref: ${{ inputs.tag }}
+
   publish:
+    needs: browser
     name: Publish package
     runs-on: ubuntu-latest
     environment: npm
@@ -86,8 +92,33 @@ jobs:
         run: npm run build
       - name: Demo build
         run: npm run build:demo
+      - name: Pack verified artifact
+        run: npm pack --pack-destination "$RUNNER_TEMP"
+      - name: Inspect package boundary
+        shell: bash
+        run: |
+          tarball="$(find "$RUNNER_TEMP" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          if [ -z "$tarball" ]; then
+            echo "npm pack did not produce a tarball" >&2
+            exit 1
+          fi
+          tar -tzf "$tarball" > package-files.txt
+          grep -F 'package/dist/lib/index.js' package-files.txt
+          grep -F 'package/dist/lib/index.d.ts' package-files.txt
+          if grep -Eq '^package/(src|test|demo|benchmark)(/|$)' package-files.txt; then
+            echo "Forbidden source or test content found in package" >&2
+            cat package-files.txt >&2
+            exit 1
+          fi
       - name: Verify package consumer
-        run: npm run verify:package
+        shell: bash
+        run: |
+          tarball="$(find "$RUNNER_TEMP" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          if [ -z "$tarball" ]; then
+            echo "npm pack did not produce a tarball" >&2
+            exit 1
+          fi
+          npm run verify:package -- "$tarball"
       - name: Publish to npm
         shell: bash
         env:
@@ -97,4 +128,9 @@ jobs:
             echo "NPM_TOKEN is not configured in repository secrets" >&2
             exit 1
           fi
-          npm publish --provenance --access public --tag "$DIST_TAG"
+          tarball="$(find "$RUNNER_TEMP" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          if [ -z "$tarball" ]; then
+            echo "verified npm tarball is missing" >&2
+            exit 1
+          fi
+          npm publish "$tarball" --provenance --access public --tag "$DIST_TAG"

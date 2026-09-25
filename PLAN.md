@@ -372,7 +372,7 @@ Phase 7A 聚焦 Renderer / GeometryArena 的公开 API 改进：
 1. **`GeometryArena.stats()`**: 暴露池化显存使用统计（pool 数量、容量、已用、碎片、活跃几何体数）。
 2. **`Renderer.create(desc)`**: 工厂方法，单对象描述符创建 Renderer，简化调用。
 3. **`Renderer.geometryArena`**: getter 暴露内部 GeometryArena 实例（供 `stats()` / `createGeometry` / `destroyGeometry`）。
-4. **多顶点 buffer**: `Geometry.vertexBuffers: BufferSlice[]` 支持多 slot 顶点绑定，executor / renderer / submitDirect / submitCulled 全部支持。
+4. **多顶点 buffer API 形状**: `Geometry.vertexBuffers: BufferSlice[]` 保留多 slot 形状；当前 `GeometryArena` 明确只支持一个 vertex-step layout，多 slot 会注册期拒绝。
 
 ### Phase 7B — GPU Timestamp Query 完成
 
@@ -380,9 +380,12 @@ Phase 7A 聚焦 Renderer / GeometryArena 的公开 API 改进：
 
 ```typescript
 const tq = new TimestampQuery(device, 2);
-tq.writeTimestamp(renderPass, 0);  // pass 开始
+const renderPass = encoder.beginRenderPass({
+  colorAttachments,
+  timestampWrites: tq.timestampWrites(0, 1),
+});
 // ... draw calls ...
-tq.writeTimestamp(renderPass, 1);  // pass 结束
+renderPass.end();
 tq.resolve(encoder);
 device.queue.submit([encoder.finish()]);
 const timestamps = await tq.readback(device);  // GPU 纳秒时间戳
@@ -391,11 +394,11 @@ const gpuMs = (timestamps[1] - timestamps[0]) / 1e6;
 
 集成点：
 - `submitDirect(items, timestamps?)`: 可选 GPU 时间戳。
-- `submitCulled(items, vpMatrix, timestamps?)`: 可选 GPU 时间戳（含 compute pass + render pass）。
+- `submitCulled(items, vpMatrix, timestamps?)`: 可选 GPU 时间戳（当前只覆盖 render pass，不包含 culling compute）。
 - `CullingPipeline.cull(vpMatrix, spheres, geometryIds, geometryCount, drawArgsTemplate?, timestamps?)`: 当前 API 同时支持 draw-args 模板与可选 compute pass 时间戳。
-- Benchmark: Direct / GPU Culling 路径自动采集 GPU 执行时间（ns → ms），输出 GPU ms (median) + GPU p95。
+- Benchmark: Direct / GPU Culling 路径自动采集 render-pass GPU 时间（ns → ms），输出 GPU render ms (median) + p95。
 
-注意：`writeTimestamp` 在 WebGPU TypeScript 类型定义中可能缺失，通过 `(pass as any).writeTimestamp(...)` 兼容。
+时间戳通过标准 WebGPU pass descriptor 的 `timestampWrites` 注入；不再调用非标准的 pass 方法。
 
 ## Benchmark 规范
 
@@ -499,7 +502,7 @@ BrainStem                     59       434 /  58.5         434 /  58.5
 Lantern                        3       531 /  70.0         531 /  70.0
 ```
 
-两条路径像素级一致。
+两条路径亮度网格近似一致。
 
 ---
 
@@ -642,7 +645,7 @@ feature 11 （ClearCoat / Transmission / AlphaBlend / MultiUV / Morph / 贴图�
 
 ### 14E — Browser Parity 完成（承接 Phase 13）
 
-Direct 与 GPU Culled 像素级一致（Chrome 153 / Dawn / Windows）已由 Phase 13 建立；
+Direct 与 GPU Culled 亮度网格近似一致（Chrome 153 / Dawn / Windows）已由 Phase 13 建立；
 14D 在 Node + fake GPU 侧复现同类不变量（无校验错误、indirect draw 数、预写顺序）。
 
 ### 下一步（按证据排序）
@@ -708,7 +711,7 @@ medium/DamagedHelmet                 1     1    1     1     380148    19.18     
 …（共 23/23）
 ```
 
-结论：**23/23 模型无 validation error、无贴图跳过、Direct 与 GPU Culled 像素级一致**。
+结论：**23/23 模型无 validation error、无贴图跳过、Direct 与 GPU Culled 亮度网格近似一致**。
 其中 `ClearCoatTest`（19 材质 / 1 贴图）与 `TextureEncodingTest`（14 材质 / 5 贴图）验证了
 **同一 image 只解码一次**与**多材质不串图**；`BrainStem`（59 材质 / 0 贴图）验证了
 白色 fallback 路径。
@@ -770,12 +773,12 @@ GLB / Material / Texture 的作用是**给 hpg 喂越来越真实的 Render Work
 | 真实 GLB → RenderItems（23 语料，几何 golden） | `test/asset-corpus.test.ts` | 完成 |
 | 真实 GLB 兼容性台账（feature → supported/ignored/wrong） | `npm run audit` | 完成 |
 | 材质/贴图路径 + 执行分组隔离 | `test/material-path.test.ts`、`test/execution-grouping.test.ts` | 完成 |
-| 真实 Chrome / WebGPU 端到端（Direct vs Culled 像素一致） | `npm run verify:browser` | 完成 |
+| 真实 Chrome / WebGPU 端到端（Direct vs Culled 亮度网格近似一致） | `npm run verify:browser` | 完成 |
 | 执行边界契约（global binding 切片 / 实例记录布局） | `test/pipeline-descriptor.test.ts` | 完成 本轮补齐 |
 
 ### 结论：execution boundary 没有「已被证据证明」的功能性缺失
 
-23/23 真实资产、229 → 236 个回归、Direct/Culled 像素一致、零 validation error ——
+23/23 真实资产、当前 hardening 279 个回归、Direct/Culled 亮度网格近似一致、零 validation error ——
 **目前没有任何证据**说明主链（RenderItem → submission → batching → indirect → culling）
 缺能力或需要重新设计。
 
@@ -828,15 +831,15 @@ instrumentation capability，不作为功能开发前置条件。
 | Gate | 命令 | 结果 |
 | --- | --- | --- |
 | 类型检查 | `npm run typecheck` | 0 error |
-| 全量回归 | `npm test` | 19 files / 230 passed |
+| 全量回归 | `npm test` | 19 files / 230 passed（冻结时历史记录；当前 hardening 为 279） |
 | 真实资产审计 | `npm run audit` | parse ok 23/23、BROKEN（静默错误数据）= 0 |
-| 真实 Chrome + WebGPU | `npm run verify:browser` | 23/23：validation error = 0、贴图跳过 = 0、Direct/Culled 像素级一致 |
+| 真实 Chrome + WebGPU | `npm run verify:browser` | 23/23：validation error = 0、贴图跳过 = 0、Direct/Culled 亮度网格近似一致 |
 | 库构建 | `npm run build` | `dist/lib/index.js`、`.d.ts` 与 sourcemap 产出；大小是一次工具链快照 |
 | Demo 构建 | `npm run build:demo` | 多页面入口全部产出（index / phase5 / glb-viewer / benchmark / glb-bench） |
 
-上表是冻结时的本地验证记录。GitHub Actions 自动执行可复现的 Node、资产、构建、打包和消费者
-检查；`npm run verify:browser` 仍需在具备 Chrome 与 WebGPU 的本地环境单独执行。Release workflow
-创建 GitHub Release，不执行 npm registry publish。
+上表是冻结时的历史验证记录。当前 hardening 重新执行了 279 个 Node 测试和 23/23 Chrome gate；
+GitHub Actions 自动执行可复现的 Node、资产、构建、打包和消费者检查，release/publish 依赖 browser gate。
+Release workflow 创建 GitHub Release，不执行 npm registry publish。
 
 ```text
 Execution chain: verified

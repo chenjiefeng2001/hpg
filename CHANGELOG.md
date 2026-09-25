@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — execution contract hardening
+
+- 修正 WebGPU `[0,1]` 投影深度、affine culling 限制、空索引 indirect 参数和 vertex/index binding size。
+- 收紧 compaction：普通提交入口拒绝 compaction 管线，自定义 WGSL 必须显式声明 `hpg-compaction-v1`。
+- 补齐 instanceData 长度/清零、geometry/index、静态 binding 对齐、跨 Renderer pipeline、glTF accessor/container 边界。
+- 修正 glTF 默认材质、缺失 NORMAL 的 flat normal 展开、纹理 sRGB 选项与共享 image 上传。
+- 浏览器 gate 现在拒绝空像素/无 draw、无匹配资产，并在 GPU completion 后发布同帧像素结果；release/npm workflow 依赖同一浏览器 gate。
+- 增加 WebGPU adapter 快速预检、GLB reload generation、Geometry ownership/context device/shader layout 校验，并为 doubleSided 未实现语义发出 warning。
+- TimestampQuery 改用标准 WebGPU `timestampWrites` pass descriptor；geometry free-list 保留对齐 padding，未使用的 sparse accessor 不再阻断解析。
+- Node 回归：19 个文件、279 个测试；Chrome 23/23 模型通过，0 validation error，Direct/Culled 亮度网格近似一致。
+
 ## 0.2.0 — 技术基线冻结（Baseline Freeze）
 
 **这是一条稳定的 `0.x` execution runtime 技术基线，不是 production-ready release。**
@@ -22,9 +33,9 @@ GPU culling、indirect execution、geometry management，以及经过真实 GLB 
 | Gate | 命令 | 结果 |
 |---|---|---|
 | 类型检查 | `npm run typecheck` | 0 error |
-| 回归测试 | `npm test` | 19 files / 230 passed |
+| 回归测试 | `npm test` | 19 files / 279 passed |
 | 真实资产审计 | `npm run audit` | parse ok 23/23、BROKEN（静默错误数据）= 0 |
-| 真实 Chrome + WebGPU | `npm run verify:browser` | 23/23：validation error = 0、贴图跳过 = 0、Direct/Culled 像素级一致 |
+| 真实 Chrome + WebGPU | `npm run verify:browser` | 23/23：validation error = 0、贴图跳过 = 0、Direct/Culled 亮度网格近似一致 |
 | 库构建 | `npm run build` | `dist/lib/index.js`、`.d.ts` 与 sourcemap 产出；大小是一次工具链快照 |
 | Demo 构建 | `npm run build:demo` | 多页面入口全部产出（index / phase5 / glb-viewer / benchmark / glb-bench） |
 
@@ -35,13 +46,13 @@ Browser validation: 23/23
 Direct/Culled parity: verified
 GPU validation errors: 0
 Known unsupported features: explicit warnings
-Known contract violations: 0
+Known contract violations: 0 within the documented narrow execution scope
 ```
 
-**测试数 236 → 230**：删除 3 个只有 `console.log`、零断言的临时审计探针
+**历史测试数 236 → 230**：删除 3 个只有 `console.log`、零断言的临时审计探针
 （`test/tmp-audit.test.ts`、`test/tmp-audit2.test.ts`、`test/tmp-dbg.test.ts` ——
 Phase 12 的脚手架，对应 6 个伪用例）。它们观察的不变量已由
-`test/render-chain.test.ts` / `test/geometry.test.ts` 的断言覆盖。
+`test/render-chain.test.ts` / `test/geometry.test.ts` 的断言覆盖；当前 Unreleased 基线为 279。
 
 ### 阶段一 hardening
 
@@ -50,7 +61,7 @@ Phase 12 的脚手架，对应 6 个伪用例）。它们观察的不变量已�
 - `submitCulled()` 强制要求 compaction pipeline，culling 测试使用 `VS_INSTANCED_COMPACTION`。
 - 包围球使用覆盖 shear 的保守矩阵范数，并增加 RenderItem、管线和 geometry primitive 校验。
 - 新增独立的手动 `browser-gate.yml`，将真实 Chrome/WebGPU 验证与普通 Node CI 分离。
-- 新增 7 个回归测试；当前测试总数为 19 个文件、237 个测试。
+- 新增 32 个回归测试；当前测试总数为 19 个文件、279 个测试。
 
 ### 消费者验证（clean install / consumer test）
 
@@ -67,22 +78,23 @@ tsc bundler + @webgpu/types   0 error
 
 ### CI and release plumbing
 
-The repository now has three GitHub Actions workflows:
+The repository now has four GitHub Actions workflows:
 
 - `.github/workflows/ci.yml` runs the reproducible Node, asset, build, package-boundary, and
   external-consumer checks for pull requests and pushes to `main`.
 - `.github/workflows/release.yml` runs the release checks when a `vX.Y.Z` tag is pushed, then creates
-  a GitHub Release with the final npm tarball attached.
+  a GitHub Release with the final npm tarball attached; it depends on the browser gate.
 - `.github/workflows/publish-npm.yml` provides a protected manual npm publication path with an
-  `NPM_TOKEN` secret, provenance, and an explicit `next` or `latest` distribution tag.
+  `NPM_TOKEN` secret, provenance, and an explicit `next` or `latest` distribution tag; it depends on
+  the same browser gate and publishes the exact tarball verified by the consumer check.
+- `.github/workflows/browser-gate.yml` runs the real Chrome/WebGPU check manually or as a reusable
+  workflow call.
 - `prepack` builds the library before `npm pack` and `npm publish` create a package archive.
-- The real Chrome/WebGPU gate remains a local command (`npm run verify:browser`) because WebGPU
-  availability on hosted runners is environment-dependent.
 - The GitHub Release workflow does not publish to the npm registry; npm publication is deliberately
   a separate manual operation.
 
-The six frozen verification gates remain part of the baseline record, but they are not all executed
-by the hosted CI runner. The browser gate must be run separately on a WebGPU-capable machine.
+The six frozen verification gates remain part of the baseline record. The browser gate is now a
+release dependency, while its hosted WebGPU capability remains runner-dependent.
 
 **F1（已修）import 期崩溃。** `src/core/texture.ts` 曾在模块顶层求值
 `GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST`，导致任何非 WebGPU 环境
@@ -183,7 +195,7 @@ UNKNOWN
 | BrainStem（59 meshes） | 434 / 58.5 | 434 / 58.5 |
 | Lantern（3 meshes） | 531 / 70.0 | 531 / 70.0 |
 
-Direct 与 GPU Culled 两条路径现在像素级一致（架构原则：合批/剔除失败不得改变视觉结果）。
+Direct 与 GPU Culled 两条路径的亮度签名一致（架构原则：合批/剔除失败不得改变视觉结果）。
 
 ### Fixed — GeometryArena 池链
 
@@ -326,7 +338,7 @@ Node 内置 `WebSocket` + CDP 驱动本机 Chrome（`headless=new --enable-unsaf
 并对比 Direct 与 GPU Culled。
 
 Chrome 153 / Dawn / Windows 实测 **23/23 模型**：无 validation error、无贴图跳过、
-Direct 与 GPU Culled 像素级一致（`gridΔ ≤ 0.1`、`litΔ = 0`）。
+Direct 与 GPU Culled 亮度网格近似一致（`gridΔ ≤ 0.1`、`litΔ = 0`）。
 其中 `ClearCoatTest`（19 材质 / 1 贴图）与 `TextureEncodingTest`（14 材质 / 5 贴图）
 验证了同一 image 只解码一次与多材质不串图；`BrainStem`（59 材质 / 0 贴图）验证了白色 fallback。
 

@@ -9,7 +9,7 @@
 评估依据：
 
 - 当前源代码和公开 API
-- 19 个测试文件、237 个测试（阶段一新增 7 个回归测试）
+- 19 个测试文件、279 个测试（本轮 hardening 新增回归覆盖）
 - 23 个真实 GLB 资产回归
 - Chrome/Dawn 本地浏览器验证记录
 - GitHub Actions 的 clean-checkout 门禁
@@ -68,7 +68,7 @@ RenderItem[]
 | 资源与内存 | 2.5 / 5 | Arena、RingBuffer、free-list 和扩容处理存在，缺少长期压力证据 |
 | 输入与输出契约 | 2.5 / 5 | RenderItem 链路清楚，复杂输入和多 pass 能力不完整 |
 | 兼容性 | 2.5 / 5 | Chrome 和当前 GLB 语料有证据，跨浏览器和跨设备证据不足 |
-| 工程化与发布 | 3.0 / 5 | CI、打包、消费者验证和发布 workflow 已建立，浏览器 gate 不在 CI |
+| 工程化与发布 | 3.0 / 5 | CI、打包、消费者验证和浏览器 gate 已建立，浏览器 gate 仍是 runner 能力依赖 |
 
 综合成熟度约为 2.8 / 5，即约 55% 至 60%。这个数字表示实现、证据、边界和生产防护的综合程度，不表示测试通过率。
 
@@ -80,7 +80,7 @@ RenderItem[]
 
 ```text
 19 test files passed
-237 tests passed
+279 tests passed
 ```
 
 已覆盖的执行不变量包括：
@@ -132,7 +132,7 @@ BROKEN = none
 - 23/23 模型
 - validation error = 0
 - texture skipped = 0
-- Direct/Culled 像素签名一致
+- Direct/Culled 亮度网格一致
 - 多材质模型不串 group=2
 
 相关实现：
@@ -142,9 +142,13 @@ BROKEN = none
 
 该证据属于单一浏览器、单一操作系统和单一 GPU 环境，不能替代跨设备验证。
 
+本轮修复后的本地 Chrome 验证重新执行了完整 23 模型 gate：两种模式均有 draw call 和非空像素签名，validation error = 0，贴图跳过 = 0，Direct/Culled 亮度网格差异为 0。该 gate 现在同时拒绝空画布、无匹配资产、模式错误，并在同一提交队列的 GPU completion 后发布像素结果。
+
 ## 5. P0：生产可用前必须处理
 
-### 5.1 group=2 静默状态复用
+以下条目保留为审计背景；截至本轮 hardening，5.1、5.2、5.4、5.5 已关闭，5.3 已建立显式契约边界但自定义 WGSL 的真实语义仍需 GPU 证明，当前状态汇总见第 11 节。
+
+### 5.1 group=2 静默状态复用（已关闭）
 
 `ExecutionBackend` 只有在 batch 有 bind group 时才调用 `setBindGroup(2, ...)`：
 
@@ -161,70 +165,37 @@ item B：bindGroup = undefined
 
 item B 可能继续使用 materialA 的 group=2。该问题可以产生串材质画面，但不一定产生 validation error。
 
-现有测试覆盖了两个非空 bind group 的切换，没有覆盖有材质到无材质的转换。
+当前测试覆盖了有材质到无材质的拒绝路径，以及非空 bind group 的切换。
 
-### 5.2 PipelineCache 未使用真实 GPU 对象身份
+### 5.2 PipelineCache 未使用真实 GPU 对象身份（已关闭）
 
-`PipelineCache` 的 canonical key 主要使用：
+`PipelineCache` 的 canonical key 现在同时使用 shader 文本、layout/buffer 的真实对象身份、size、byte offset 和 byte length；cache 还隔离 GPUDevice，并保存不可变 descriptor snapshot。Renderer 的 global bind group 缓存改用 pipeline 对象身份，且拒绝跨 Renderer pipeline。
 
-- shader 文本
-- layout label
-- buffer size
-- byte offset
-- byte length
-
-相关代码：
-
-- `src/core/pipeline-cache.ts:26`
-- `src/core/renderer.ts:282`
-
-不同 GPUBuffer 如果 size 相同，或不同 BindGroupLayout 如果 label 相同，可能产生相同 key。Renderer 随后按 pipeline id 缓存 global bind group，存在错误资源复用的可能。
-
-当前缺少以下测试：
+回归测试覆盖：
 
 - 不同 GPUBuffer、相同 size
 - 不同 BindGroupLayout、相同 label
-- 不同对象身份但相同 descriptor
+- 相同对象/相同 descriptor 的缓存命中
+- descriptor snapshot 与跨 device 拒绝
 
-### 5.3 compaction shader 契约没有被 runtime 强制验证
+### 5.3 compaction shader 契约没有被 runtime 强制验证（部分关闭）
 
 `submitCulled()` 要求使用 compaction pipeline：
 
 - `src/core/renderer.ts:574`
 
-但注册和提交阶段没有验证 vertex shader 是否真正读取 compaction mapping。
+但注册和提交阶段现在要求内置 compaction shader，或要求自定义 WGSL 显式声明 `compactionContract: 'hpg-compaction-v1'`；普通提交入口会拒绝 compaction pipeline。该契约能阻止误用，但仍不能替代真实 shader 编译/执行证据，自定义 WGSL 的语义验证仍是发布前责任。
 
-fake GPU：
-
-- 不编译 WGSL
-- 不执行 compute shader
-- 不执行 atomic
-
-因此部分 Node 测试只能证明命令录制形状，不能证明真实 compaction 语义。
-
-真实 viewer 使用了正确 shader，但 demo 的正确使用不能替代 runtime contract。
-
-### 5.4 任意 transform 下的包围球可能不保守
+### 5.4 任意 transform 下的包围球可能不保守（已关闭：culling 限定 affine）
 
 当前 culling radius 使用矩阵列范数：
 
 - `src/core/renderer.ts:721`
 - `src/core/renderer.ts:727`
 
-公共 `RenderItem.transforms` 没有限制 shear：
+公共 `RenderItem.transforms` 仍允许一般矩阵，但 `submitCulled()` 明确限制为 affine（末行 `[0,0,0,1]`）；affine shear 由矩阵 1/无穷范数乘积覆盖，projective transform 会在提交前报错。Direct 路径不使用该 CPU 包围球契约。
 
-- `src/types.ts:131`
-
-对于一般带 shear 的 affine transform，列范数不一定覆盖完整变换，可能低估世界空间包围球并错误剔除对象。
-
-需要补充：
-
-- rotation + non-uniform scale
-- shear
-- 多个 parent transform 组合
-- frustum plane 边界
-
-### 5.5 真实 WebGPU 验证未进入自动发布门禁
+### 5.5 真实 WebGPU 验证未进入自动发布门禁（已关闭：release/publish 依赖 browser gate）
 
 当前 CI 主要验证：
 
@@ -243,22 +214,13 @@ workflow：
 - `.github/workflows/publish-npm.yml`
 - `.github/workflows/browser-gate.yml`
 
-真实 Chrome/WebGPU 仍是本地手工 gate。发布前仍可能只通过结构测试，而未执行真实 shader、atomic 或 indirect draw。
+真实 Chrome/WebGPU 现在通过 `browser-gate.yml` 提供手动和 reusable workflow 两种入口；GitHub Release 与 npm publish job 都依赖同一 gate，hosted runner 是否提供 WebGPU 仍由环境决定。
 
 ## 6. P1：重要生产差距
 
-### 6.1 输入契约缺少完整运行时验证
+### 6.1 输入契约（已大幅收紧，仍非完整反射系统）
 
-需要验证：
-
-- transforms 长度
-- instanceCount 合法性
-- instanceData 长度
-- bytesPerInstance 对齐
-- modelMatrixOffset 合法性
-- bounding 和 depth 的有限性
-- vpMatrix 长度
-- geometry、primitive、target 的组合
+当前已验证 transforms、instanceCount、instanceData 长度与有限性、bytesPerInstance/modelMatrixOffset 对齐、bounding/depth、vpMatrix、geometry/pipeline layout、primitive、target format、index range 和 affine culling transform。动态用户 bind group layout、任意多 slot geometry 和 WGSL 反射仍不在支持域内。
 
 ### 6.2 公共 API 宽于实际 Executor
 
@@ -296,17 +258,9 @@ workflow：
 - partial visibility 下的 compaction mapping
 - indirect instance count
 
-### 6.5 compute 和 render 分成两个 submit
+### 6.5 compute 和 render 分成两个 submit（已关闭）
 
-`CullingPipeline.cull()` 自己提交 compute：
-
-- `src/core/culling.ts:308`
-
-Renderer 再提交 render：
-
-- `src/core/renderer.ts:797`
-
-这会限制外部 command encoder、统一错误范围和 frame-level profiling。
+`Renderer.submitCulled()` 现在把 culling compute pass 和 render pass 录制到同一个 `GPUCommandEncoder`，只提交一次；`CullingPipeline.cull()` 直接调用仍保留独立提交以维持独立 API。
 
 ### 6.6 culling timestamp 不完整
 
@@ -316,14 +270,9 @@ Renderer 再提交 render：
 
 当前 GPU timing 主要覆盖 render pass，可能低估 culling 的 GPU 成本。
 
-### 6.7 glTF 语义仍有静默缺失
+### 6.7 glTF 语义仍有未实现项
 
-明确例子：
-
-- sparse accessor 没有读取分支：`src/core/gltf.ts:335`
-- `doubleSided`、metallic、roughness 被解析但没有完整进入执行语义
-- `texCoord` 没有完整驱动 UV 选择
-- 部分 parser 失败只 console 输出，没有进入 `asset.warnings`
+当前 parser 已对 sparse accessor、截断 buffer/view/accessor、错误索引、默认材质和缺失 NORMAL 给出显式处理；仍未实现或仅告警的项目包括 double-sided 执行语义（现在会显式 warning）、完整 PBR texture、texCoord 选择、mipmap 链和动画。
 
 ### 6.8 热路径存在大量临时分配
 
@@ -337,14 +286,12 @@ Renderer 再提交 render：
 
 ## 7. P2：工程和方法学差距
 
-- browser parity 使用亮度 grid 和阈值，不是严格逐像素相等：`benchmark/browser-material-check.mjs:220`
-- pixel signature 为空时，gate 不一定失败：`demo/glb-viewer.ts:823`
+- browser parity 使用亮度 grid 和阈值，不是严格逐像素相等：`benchmark/browser-material-check.mjs`
 - Phase 5 和 Phase 6 benchmark 的 transform 与空间位置口径需要重新核对
-- coverage provider 和 coverage script 尚未纳入 package contract：`vitest.config.ts:8`
+- coverage provider 和 coverage script 尚未纳入 package contract：`vitest.config.ts`
 - 没有 lint gate
 - 没有跨浏览器和跨 GPU CI
-- `emptyOutDir: false` 可能保留旧的 dist 文件：`vite.config.ts:16`
-- consumer check 主要验证 import、identity 和 bundler TypeScript：`scripts/verify-package.mjs:50`
+- consumer check 主要验证 import、代表性 runtime exports 和 bundler TypeScript：`scripts/verify-package.mjs`
 - Node16/NodeNext declaration 解析仍是已知限制
 
 ## 8. UNKNOWN，不应直接转为 TODO
@@ -366,9 +313,7 @@ Renderer 再提交 render：
 
 ## 9. 最小下一阶段路线
 
-### 阶段一：消除静默错误
-
-优先处理：
+### 阶段一：消除静默错误（已完成）
 
 1. group=2 从有材质切换到无材质
 2. PipelineCache 的真实 GPU 对象身份
@@ -437,21 +382,37 @@ Renderer 再提交 render：
   -> 支持矩阵和发布策略是否明确
 ```
 
-## 11. 阶段一修复状态
+## 11. 阶段一与第二轮 hardening 状态
 
-本轮已完成以下确定性修复：
+本轮已关闭的确定性问题：
 
-- group=2 材质 bind group 缺失时，在 submit、submitDirect、submitCulled 和 Executor 入口显式报错，避免继承上一项的材质状态。
-- PipelineCache 的 bind group layout 和 global buffer key 纳入真实 GPU 对象身份，避免相同 label/size 的不同资源发生碰撞。
-- submitCulled 强制要求 `compaction: true`，并将 fake GPU 测试中的 culling helper 改为使用 `VS_INSTANCED_COMPACTION`。
-- culling 包围球使用矩阵 1/无穷范数乘积作为保守线性变换上界，覆盖 shear transform。
-- 增加 RenderItem transforms、instanceCount、instanceData、bounding、depth、vpMatrix 和 geometry/pipeline primitive 校验。
-- 管线注册阶段拒绝非法 modelMatrixOffset、bytesPerInstance、空/多 target 和未实现的额外 bind group layout。
-- 新增对应回归测试，当前测试总数为 19 个文件、237 个测试。
+- WebGPU 投影矩阵改为 NDC 深度 `[0,1]`，near/far 映射为 `0/1`。
+- 普通 `submit()` / `submitDirect()` 拒绝 compaction pipeline；自定义 compaction WGSL 必须声明 `compactionContract: 'hpg-compaction-v1'`。
+- `submitCulled()` 拒绝 projective transform；affine shear 使用保守矩阵范数；culling geometry ID 长度、范围和分组顺序显式校验。
+- instanceData 要求精确长度，三条写入路径都会清零额外字段；bytesPerInstance 使用 16 字节对齐。
+- Geometry 拒绝多 vertex slot、instance-step、非法 stride/attribute、错误 index format、越界索引和 triangle-list 非整三角形索引；vertex/index binding 传递 byteLength。
+- Renderer 拒绝 target/depth format 不匹配、stencil/color depth format、未配置或跨 device 的 context；静态 global uniform binding 校验设备对齐、范围与 UNIFORM usage。
+- PipelineCache 使用设备隔离、对象身份和 descriptor snapshot；Renderer 按 pipeline 对象而非局部 numeric id 缓存和合批，并拒绝跨 Renderer pipeline。
+- Renderer 拒绝未由当前 arena 创建或已销毁的 Geometry；内置实例 shader 的布局契约按规范化 WGSL 校验，不能用注释绕过。
+- glTF 严格校验 GLB/container/bufferView/accessor，拒绝 sparse accessor、截断数据和非法索引；primitive 未声明 material 时使用默认材质；缺失 NORMAL 时展开 flat normals。
+- 修复默认 UV 原点、共享 image 只上传一次、sRGB 选项、场景 reload 的 Geometry 回收、timestamp feature 检查和 benchmark transform 组合；reload generation 在异步文件读取前保留，避免旧请求覆盖新模型。
+- culling compute 与 render 使用同一 command encoder；GPU timestamp 通过标准 `timestampWrites` pass descriptor 注入；browser gate 先做 WebGPU adapter 快速预检，再拒绝空像素/无 draw/无资产/模式错误，并在同一提交队列的 GPU completion 后发布 harness 结果。
+- release 与 npm publish workflow 依赖 reusable browser gate；发布前验证并发布同一个 tarball。
 
-阶段一仍未完全关闭的事项：
+当前验证：
 
-- 本地 Chrome/WebGPU 小规模回归已通过：3 个模型、Direct/Culled、0 validation error、0 texture skip、像素签名一致。
-- 真实 Chrome/WebGPU 浏览器验证仍未进入 GitHub hosted runner 的自动发布门禁；已增加 `browser-gate.yml` 作为发布前可手动触发的独立 gate。
-- 0%/部分可见 culling、device lost、资源压力和跨设备矩阵仍需要真实 workload 证据。
-- compaction flag 已强制，但自定义 WGSL 是否正确读取 compaction mapping 仍必须由真实 shader 编译和浏览器验证证明。
+```text
+19 test files / 279 tests passed
+23/23 GLB audit: parse ok, BROKEN = 0
+Chrome 23/23: validation error = 0, texture skipped = 0,
+Direct/Culled brightness-grid parity = 0
+```
+
+仍不能由本轮静态/本地证据关闭的事项：
+
+- 自定义 compaction WGSL 的真实 mapping 语义仍需 shader 编译和 GPU 执行验证；显式 contract 是信任边界，不是 WGSL 反射证明。
+- 用户自定义 dynamic group layout、多 vertex slot、完整 PBR、mipmap 链、alpha BLEND、double-sided 执行语义仍未实现（double-sided 已有显式 warning）。
+- `FS_DEPTH_ONLY` 仍不是无 color output 的真正 depth-only pipeline；该 API 需要单独的多 attachment 设计。
+- culling timestamp 目前只覆盖 render pass，不能代表完整 compute+render GPU 成本。
+- 0%/部分可见 culling 的真实 GPU mapping、device lost、长时间资源压力、跨设备和跨浏览器矩阵仍需要专门 workload。
+- hosted runner 是否提供 WebGPU 取决于环境；browser gate 现在会让发布 fail closed，而不是静默跳过。

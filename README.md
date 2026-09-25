@@ -53,10 +53,10 @@ errors; it does not restore the missing types.
 > produces `TS2834`; use `bundler` or `node` resolution until the declaration extension fix is made.
 > Runtime is unaffected.
 
-The real Chrome validation command is a separate local gate. It requires Node 22 or newer, a local
+The real Chrome validation command is a separate WebGPU gate. It requires Node 22 or newer, a local
 Chrome or Chromium installation, and WebGPU support. Set `CHROME_PATH` when the browser is not in a
-standard location. This command is not part of the hosted GitHub Actions runner because WebGPU
-availability there is environment-dependent.
+standard location. The same check is exposed as a reusable GitHub workflow and is required by the
+release and npm publication workflows; hosted WebGPU availability still depends on the runner.
 
 ## Release Status
 
@@ -76,9 +76,9 @@ Frozen verification is a historical, reproducible baseline snapshot:
 
 ```text
 npm run typecheck      0 error
-npm test               19 files / 237 passed
+npm test               19 files / 279 passed
 npm run audit          parse ok 23/23 · BROKEN = 0
-npm run verify:browser 23/23 · validation errors 0 · Direct/Culled parity
+npm run verify:browser 23/23 · validation errors 0 · Direct/Culled brightness-grid parity
 npm run build          dist/lib/index.js + declarations + source maps
 npm run build:demo     all five page entries emitted
 ```
@@ -86,9 +86,8 @@ npm run build:demo     all five page entries emitted
 The package boundary is verified from outside the repository with `npm run verify:package`:
 `npm pack` installs the tarball in a fresh directory, imports it as bare Node ESM, and runs a
 strict TypeScript consumer check with `@webgpu/types`. The published file allowlist is `dist/lib`,
-`LICENSE`, `CHANGELOG.md`, and `README.md`, plus npm's generated `package.json` metadata. It does not
-contain `src`, `test`, `demo`, or `benchmark`. The build size is a toolchain snapshot, not a package
-contract.
+`LICENSE`, `CHANGELOG.md`, and `README.md`, plus npm's generated `package.json` metadata. It does not contain `src`, `test`, `demo`, or `benchmark`. The build size is a toolchain snapshot, not a package
+contract; source maps remain part of the published `dist/lib` artifact.
 
 ## Quick Start
 
@@ -150,6 +149,7 @@ import { VS_INSTANCED_COMPACTION, FS_COLOR } from '@hpg/runtime';
 const culled = renderer.registerPipeline({
   label: 'culled',
   compaction: true,
+  // Built-in compaction shaders are trusted by the runtime.
   vsCode: VS_INSTANCED_COMPACTION,
   fsCode: FS_COLOR,
   vertexLayouts: [...],
@@ -164,6 +164,8 @@ const stats = renderer.submitCulled(items, viewProjectionMatrix);
 
 `globalLayout`, `uniformBuffer`, `items`, and `viewProjectionMatrix` are application-owned values in
 this fragment. The GPU computes visibility and draws only visible instances through indirect draw.
+`submitCulled()` only accepts affine transforms; custom compaction WGSL must explicitly set
+`compactionContract: 'hpg-compaction-v1'`.
 
 Per-instance bounding spheres are derived from `Geometry.bounds` (local AABB) times each
 instance matrix; provide `RenderItem.bounding` to override. Items sharing one pipeline are
@@ -187,10 +189,13 @@ grouped per geometry — each geometry gets its own indirect draw args.
 
 | Symbol | Description |
 |--------|-------------|
-| `geometryArena.createGeometry(vtx, layouts, idx?)` | Upload vertices + optional indices, return `Geometry` |
+| `geometryArena.createGeometry(vtx, layouts, idx?, indexFormat?)` | Upload one vertex-step layout + optional typed indices; format is inferred for `Uint32Array`/`Uint16Array` and mismatches are rejected |
 | `geometryArena.destroyGeometry(geo)` | Free arena allocation (GPU memory recycled) |
 | `geometryArena.stats()` | Pool usage: capacity, used bytes, fragmentation, live count |
 | `geometry.bounds` | Local-space AABB derived from the position attribute (used by `submitCulled`) |
+
+The current Arena supports one vertex-step layout; multi-slot and instance-step layouts are rejected explicitly.
+`RenderItem.instanceData`, when provided, must exactly match the pipeline's post-matrix float count.
 
 ### Asset Pipeline
 
@@ -203,6 +208,8 @@ grouped per geometry — each geometry gets its own indirect draw args.
 | `createBrowserImageDecoder()` | Default `ImageDecoder` (GLB image bytes → `createImageBitmap` → RGBA8) |
 | `createMaterialBindGroupLayout(device)` | `group 2` layout: `texture` / `sampler` / `material uniform` |
 | `ImageDecoder` | Inject your own decoder (Node tests / asset pipelines) — the parser never decodes |
+
+`ImportedScene.dispose()` releases the scene's arena geometry; any `RenderItem` created from that scene is invalid afterward and must not be submitted.
 
 ### Material path (group 2)
 
@@ -255,9 +262,10 @@ renderer.submit(items);
 | Symbol | Description |
 |--------|-------------|
 | `new TimestampQuery(device, 2)` | GPU timestamp query |
-| `tq.writeTimestamp(pass, index)` | Write timestamp to slot |
+| `tq.timestampWrites(begin, end)` | Standard pass-descriptor timestamp query slots |
 | `tq.resolve(encoder)` | Resolve query set |
 | `await tq.readback(device)` | Async GPU time in nanoseconds |
+| `tq.destroy()` | Release query resources; call only after readback settles |
 
 ### Lifecycle
 
@@ -378,7 +386,7 @@ Open `benchmark/glb-bench.html` in the browser.
 
 | Condition | Rule |
 |-----------|------|
-| `pipeline.id` | Must match (same content hash) |
+| `pipeline` object | Same registered object identity (not merely numeric id) |
 | `geometry` | Same reference (same arena allocation) |
 | `bindGroup` | Same reference |
 | Instance data layout | Unified across compatible items |
@@ -429,16 +437,16 @@ npm run audit heavy      # filter by path substring
 
 ## CI and GitHub Release
 
-The repository uses three GitHub Actions workflows. All of them require the source, tests, benchmark
+The repository uses four GitHub Actions workflows. All of them require the source, tests, benchmark
 assets, and `package-lock.json` to be committed; a local untracked file is not available to a clean
 runner.
 
 | Workflow | Trigger | Automated checks |
 |----------|---------|------------------|
 | `.github/workflows/ci.yml` | Push to `main`, pull request, or manual dispatch | Node 18/20/22 typecheck and tests; Node 22 asset audit, library/demo builds, package-boundary inspection, external consumer verification, and tarball artifact upload |
-| `.github/workflows/release.yml` | Push a `vX.Y.Z` tag | Version consistency, typecheck, tests, asset audit, builds, package-boundary inspection, external consumer verification, and GitHub Release creation with the final `.tgz` |
-| `.github/workflows/publish-npm.yml` | Manual dispatch for an existing release tag | Re-runs the release gates, verifies the package consumer, and publishes `@hpg/runtime` to npm with provenance |
-| `.github/workflows/browser-gate.yml` | Manual dispatch for a ref | Runs the real Chrome/WebGPU asset validation separately from the Node matrix |
+| `.github/workflows/release.yml` | Push a `vX.Y.Z` tag | Version consistency, browser gate, typecheck, tests, asset audit, builds, package-boundary inspection, external consumer verification, and GitHub Release creation with the final `.tgz` |
+| `.github/workflows/publish-npm.yml` | Manual dispatch for an existing release tag | Re-runs the browser and release gates, verifies the exact package tarball consumer, and publishes `@hpg/runtime` to npm with provenance |
+| `.github/workflows/browser-gate.yml` | Manual dispatch or reusable workflow call | Runs the real Chrome/WebGPU asset validation separately from the Node matrix; release and npm publication depend on it |
 
 The browser WebGPU gate is intentionally separate. For a local run:
 
@@ -447,8 +455,8 @@ npm run verify:browser
 ```
 
 The repository also provides `.github/workflows/browser-gate.yml` for a manual GitHub-hosted-runner
-check. Run it against the release ref before creating a tag; if the runner does not expose WebGPU,
-use a machine with a supported browser instead of treating the Node matrix as a GPU gate.
+check and for the release/publish dependency chain. If the runner does not expose WebGPU, the gate
+fails closed; use a machine with a supported browser and run the local command instead.
 
 The release workflow creates a GitHub Release and attaches the npm tarball. It does not run
 `npm publish`; publication is a separate protected operation through `publish-npm.yml`.
@@ -460,7 +468,7 @@ The release workflow creates a GitHub Release and attaches the npm tarball. It d
 3. Push the version tag and wait for the GitHub Release checks to pass.
 4. Run the `Publish npm package` workflow with that tag and choose `next` or `latest`.
 
-The workflow validates the tag, reruns the package gates, runs the external consumer check, and
+The workflow validates the tag, reruns the browser and package gates, runs the external consumer check, and
 publishes with npm provenance. The default `next` channel reflects that `0.2.0` is a technical
 baseline rather than a production-ready release. Use `latest` only when that channel should expose
 the version to unqualified `npm install @hpg/runtime` commands.

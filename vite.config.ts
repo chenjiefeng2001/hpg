@@ -13,7 +13,7 @@ export default defineConfig({
       fileName: 'index',
     },
     outDir: 'dist/lib',
-    emptyOutDir: false,
+    emptyOutDir: true,
     sourcemap: true,
     rollupOptions: {
       external: [],
