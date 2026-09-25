@@ -7,6 +7,17 @@
 
 import type { PipelineDesc, ResolvedPipeline } from '../types';
 
+const objectIds = new WeakMap<object, number>();
+let nextObjectId = 1;
+
+function objectId(value: object): number {
+  const existing = objectIds.get(value);
+  if (existing !== undefined) return existing;
+  const id = nextObjectId++;
+  objectIds.set(value, id);
+  return id;
+}
+
 /** FNV-1a 64 位散列（BigInt 实现）。 */
 export function fnv1a64(input: string): bigint {
   let h = 0xcbf29ce484222325n;
@@ -32,10 +43,8 @@ export function canonicalize(desc: PipelineDesc): string {
     // compaction 决定 group=1 的绑定布局（単实例 vs 实例+compaction mapping）。
     cmp: desc.compaction === true,
     v: desc.vertexLayouts,
-    bgl: desc.bindGroupLayouts.map((l) => l.label ?? ''),
-    // 包含 byteOffset / byteLength：否则「同一 buffer 的不同切片」会塌到同一个 key，
-    // 拿到错误的 global bind group。
-    g: desc.globalBindings.map((b) => `${b.binding}:${b.buffer.size}:${b.byteOffset ?? 0}:${b.byteLength ?? 0}`),
+    bgl: desc.bindGroupLayouts.map((l) => `${objectId(l)}:${l.label ?? ''}`),
+    g: desc.globalBindings.map((b) => `${b.binding}:${objectId(b.buffer)}:${b.buffer.size}:${b.byteOffset ?? 0}:${b.byteLength ?? 0}`),
     d: desc.depth,
     t: desc.targets,
     p: desc.primitive,

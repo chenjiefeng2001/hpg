@@ -125,7 +125,7 @@ export interface RenderItem {
   geometry: Geometry;
   /** 管线句柄（内容哈希缓存命中）。 */
   pipeline: ResolvedPipeline;
-  /** 管线声明之外的额外绑定组。 */
+  /** 管线声明之外的额外绑定组；管线声明 group 2 时必须提供。 */
   bindGroup?: GPUBindGroup;
   /**
    * 一个或多个列主序 4x4 变换矩阵。

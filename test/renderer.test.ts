@@ -199,6 +199,38 @@ describe('Renderer depth sorting', () => {
   });
 });
 
+describe('RenderItem 输入校验', () => {
+  it('拒绝非法 transform 长度、实例数量和非有限值', () => {
+    const { renderer, pipeline, cube } = setup();
+
+    expect(() => renderer.submit([{ geometry: cube, pipeline, transforms: new Float32Array(15) }])).toThrow(
+      'multiple of 16',
+    );
+    expect(() => renderer.submit([{
+      geometry: cube,
+      pipeline,
+      transforms: new Float32Array(16),
+      instanceCount: 2,
+    }])).toThrow('cannot exceed');
+    expect(() => renderer.submit([{
+      geometry: cube,
+      pipeline,
+      transforms: new Float32Array([NaN, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]),
+    }])).toThrow('finite');
+  });
+
+  it('拒绝非法 bounding 和 depth', () => {
+    const { renderer, pipeline, cube } = setup();
+
+    expect(() => renderer.submit([{
+      geometry: cube,
+      pipeline,
+      bounding: { centerX: 0, centerY: 0, centerZ: 0, radius: -1 },
+    }])).toThrow('radius');
+    expect(() => renderer.submit([{ geometry: cube, pipeline, depth: NaN }])).toThrow('depth');
+  });
+});
+
 describe('Renderer dispose', () => {
   it('dispose does not throw and can be called twice', () => {
     const { renderer } = setup();

@@ -76,7 +76,7 @@ Frozen verification is a historical, reproducible baseline snapshot:
 
 ```text
 npm run typecheck      0 error
-npm test               19 files / 230 passed
+npm test               19 files / 237 passed
 npm run audit          parse ok 23/23 · BROKEN = 0
 npm run verify:browser 23/23 · validation errors 0 · Direct/Culled parity
 npm run build          dist/lib/index.js + declarations + source maps
@@ -207,6 +207,7 @@ grouped per geometry — each geometry gets its own indirect draw args.
 ### Material path (group 2)
 
 Bind groups are slotted by the renderer: **group 0 = global, group 1 = instances (internal), group 2+ = your own layouts**.
+A pipeline that declares a group 2 layout requires every `RenderItem` using it to provide `bindGroup`; missing state is rejected before recording instead of inheriting a previous material.
 To sample `baseColorTexture`:
 
 The following fragment assumes that `asset`, `scene`, `globalLayout`, `uniformBuffer`, and the
@@ -437,13 +438,17 @@ runner.
 | `.github/workflows/ci.yml` | Push to `main`, pull request, or manual dispatch | Node 18/20/22 typecheck and tests; Node 22 asset audit, library/demo builds, package-boundary inspection, external consumer verification, and tarball artifact upload |
 | `.github/workflows/release.yml` | Push a `vX.Y.Z` tag | Version consistency, typecheck, tests, asset audit, builds, package-boundary inspection, external consumer verification, and GitHub Release creation with the final `.tgz` |
 | `.github/workflows/publish-npm.yml` | Manual dispatch for an existing release tag | Re-runs the release gates, verifies the package consumer, and publishes `@hpg/runtime` to npm with provenance |
+| `.github/workflows/browser-gate.yml` | Manual dispatch for a ref | Runs the real Chrome/WebGPU asset validation separately from the Node matrix |
 
-The browser WebGPU gate is intentionally separate. Run it locally when the release scope includes
-real Chrome rendering:
+The browser WebGPU gate is intentionally separate. For a local run:
 
 ```bash
 npm run verify:browser
 ```
+
+The repository also provides `.github/workflows/browser-gate.yml` for a manual GitHub-hosted-runner
+check. Run it against the release ref before creating a tag; if the runner does not expose WebGPU,
+use a machine with a supported browser instead of treating the Node matrix as a GPU gate.
 
 The release workflow creates a GitHub Release and attaches the npm tarball. It does not run
 `npm publish`; publication is a separate protected operation through `publish-npm.yml`.

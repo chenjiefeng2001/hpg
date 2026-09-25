@@ -31,6 +31,14 @@ function makeDesc(vs = 'vs1', fs = 'fs1'): PipelineDesc {
   };
 }
 
+function makeResourceDesc(layout: GPUBindGroupLayout, buffer: GPUBuffer): PipelineDesc {
+  return {
+    ...makeDesc(),
+    bindGroupLayouts: [layout],
+    globalBindings: [{ binding: 0, buffer }],
+  };
+}
+
 describe('PipelineCache', () => {
   it('returns same pipeline for identical desc (deduplication)', () => {
     const cache = new PipelineCache();
@@ -47,6 +55,21 @@ describe('PipelineCache', () => {
     const device = fakeDevice();
     const p1 = cache.getOrCreate(device, makeDesc('vs1', 'fs1'));
     const p2 = cache.getOrCreate(device, makeDesc('vs2', 'fs2'));
+    expect(p1).not.toBe(p2);
+    expect(cache.size).toBe(2);
+  });
+
+  it('does not reuse pipelines for different GPU resource identities', () => {
+    const cache = new PipelineCache();
+    const device = fakeDevice();
+    const layoutA = { label: 'same' } as unknown as GPUBindGroupLayout;
+    const layoutB = { label: 'same' } as unknown as GPUBindGroupLayout;
+    const bufferA = { size: 64 } as GPUBuffer;
+    const bufferB = { size: 64 } as GPUBuffer;
+
+    const p1 = cache.getOrCreate(device, makeResourceDesc(layoutA, bufferA));
+    const p2 = cache.getOrCreate(device, makeResourceDesc(layoutB, bufferB));
+
     expect(p1).not.toBe(p2);
     expect(cache.size).toBe(2);
   });

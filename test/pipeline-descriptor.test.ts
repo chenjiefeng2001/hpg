@@ -16,7 +16,7 @@
 import { describe, it, expect } from 'vitest';
 
 import { Renderer, uniformBindGroupLayout } from '../src/core/renderer';
-import { VS_INSTANCED, FS_COLOR } from '../src/shaders/instance';
+import { VS_INSTANCED, VS_INSTANCED_COMPACTION, FS_COLOR } from '../src/shaders/instance';
 import { createFakeGPU } from './fake-gpu';
 import type { Geometry, GlobalBinding, PipelineDesc, RenderItem, ResolvedPipeline } from '../src/types';
 
@@ -48,7 +48,7 @@ function register(
 ): ResolvedPipeline {
   return renderer.registerPipeline({
     label: 'descriptor-contract',
-    vsCode: VS_INSTANCED,
+    vsCode: extra.compaction ? VS_INSTANCED_COMPACTION : VS_INSTANCED,
     fsCode: FS_COLOR,
     vertexLayouts: LAYOUT,
     bindGroupLayouts: [uniformBindGroupLayout(device, [
@@ -171,11 +171,13 @@ describe('modelMatrixOffset 契约', () => {
     for (let i = 0; i < 4; i++) expect(f[16 + i]!).toBeCloseTo(EXTRA[i]!, 6);
   });
 
-  it('非法布局在注册期显式报错（而不是静默写错位置）', () => {
+  it('非法实例布局在注册期显式报错（而不是静默写错位置）', () => {
     const { renderer, device } = setup();
     const buffer = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
     expect(() => register(renderer, device, [{ binding: 0, buffer }], { modelMatrixOffset: 8 })).toThrow(/16 的倍数/);
+    expect(() => register(renderer, device, [{ binding: 0, buffer }], { modelMatrixOffset: -16 })).toThrow(/非负/);
+    expect(() => register(renderer, device, [{ binding: 0, buffer }], { bytesPerInstance: 65 })).toThrow(/4 字节/);
     expect(() =>
       register(renderer, device, [{ binding: 0, buffer }], { bytesPerInstance: 64, modelMatrixOffset: 16 }),
     ).toThrow(/bytesPerInstance/);

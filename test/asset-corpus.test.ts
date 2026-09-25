@@ -23,7 +23,7 @@ import { parseGltf } from '../src/core/gltf';
 import { lookAt, perspective, multiply } from '../src/core/math';
 import { listCorpus, auditGlb, type AssetAudit } from '../benchmark/asset-compat';
 import { createFakeGPU } from './fake-gpu';
-import { VS_INSTANCED, FS_COLOR } from '../src/shaders/instance';
+import { VS_INSTANCED, VS_INSTANCED_COMPACTION, FS_COLOR } from '../src/shaders/instance';
 import type { Geometry, RenderItem } from '../src/types';
 
 const FORMAT: GPUTextureFormat = 'bgra8unorm';
@@ -135,7 +135,7 @@ function registerPipeline(renderer: Renderer, compaction: boolean) {
   });
   return renderer.registerPipeline({
     label: compaction ? 'corpus-culled' : 'corpus-direct',
-    vsCode: VS_INSTANCED,
+    vsCode: compaction ? VS_INSTANCED_COMPACTION : VS_INSTANCED,
     fsCode: FS_COLOR,
     vertexLayouts: CANONICAL_LAYOUT,
     bindGroupLayouts: [layout],

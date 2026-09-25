@@ -43,6 +43,15 @@ Known contract violations: 0
 Phase 12 的脚手架，对应 6 个伪用例）。它们观察的不变量已由
 `test/render-chain.test.ts` / `test/geometry.test.ts` 的断言覆盖。
 
+### 阶段一 hardening
+
+- 缺少 group=2 材质 bind group 时，提交入口现在显式报错，不再继承上一项的材质状态。
+- PipelineCache key 纳入 GPU layout 和 buffer 的对象身份。
+- `submitCulled()` 强制要求 compaction pipeline，culling 测试使用 `VS_INSTANCED_COMPACTION`。
+- 包围球使用覆盖 shear 的保守矩阵范数，并增加 RenderItem、管线和 geometry primitive 校验。
+- 新增独立的手动 `browser-gate.yml`，将真实 Chrome/WebGPU 验证与普通 Node CI 分离。
+- 新增 7 个回归测试；当前测试总数为 19 个文件、237 个测试。
+
 ### 消费者验证（clean install / consumer test）
 
 在项目外的全新空目录里做真实消费者验证：`npm pack` → 安装 tarball → `import` → `tsc`。

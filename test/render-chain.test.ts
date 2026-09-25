@@ -15,7 +15,7 @@ import { GeometryArena } from '../src/core/geometry';
 import { importGltfAsset, sceneToRenderItems } from '../src/core/asset-importer';
 import { extractFrustumPlanes, sphereInFrustum } from '../src/core/culling';
 import { lookAt, perspective, multiply, invert } from '../src/core/math';
-import { VS_INSTANCED, FS_COLOR } from '../src/shaders/instance';
+import { VS_INSTANCED, VS_INSTANCED_COMPACTION, FS_COLOR } from '../src/shaders/instance';
 import { createFakeGPU } from './fake-gpu';
 import type { GltfAsset } from '../src/core/gltf';
 import type { RenderItem } from '../src/types';
@@ -69,7 +69,7 @@ function registerPipeline(
   });
   return renderer.registerPipeline({
     label: opts.label ?? 'chain',
-    vsCode: VS_INSTANCED,
+    vsCode: opts.compaction ? VS_INSTANCED_COMPACTION : VS_INSTANCED,
     fsCode: FS_COLOR,
     vertexLayouts: LAYOUT,
     bindGroupLayouts: [layout],
@@ -313,7 +313,7 @@ describe('group=1 绑定范围（dynamic offset 越界防护）', () => {
     const pipeline = registerPipeline(renderer);
     const geo = cubeGeometry(renderer.geometryArena);
     const items: RenderItem[] = [
-      { geometry: geo, pipeline, transforms: translate(0), instanceCount: 2 },
+      { geometry: geo, pipeline, transforms: new Float32Array([...translate(0), ...translate(0)]), instanceCount: 2 },
       { geometry: geo, pipeline, transforms: translate(5) },
       { geometry: geo, pipeline, transforms: translate(10) },
     ];
@@ -530,6 +530,26 @@ describe('submitCulled 分组与 draw args', () => {
     renderer.dispose();
   });
 
+  it('shear transform 使用保守的矩阵范数计算包围球', () => {
+    const { renderer, recorded } = makeRenderer();
+    const pipeline = registerPipeline(renderer, { compaction: true });
+    const geo = cubeGeometry(renderer.geometryArena, 2);
+    const shear = new Float32Array([
+      1, 0, 0, 0,
+      2, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1,
+    ]);
+    const vp = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+
+    renderer.submitCulled([{ geometry: geo, pipeline, transforms: shear }], vp);
+
+    const sphereWrite = recorded.writes.find((w) => w.bytes.byteLength === 16)!;
+    const sphere = new Float32Array(sphereWrite.bytes.buffer, sphereWrite.bytes.byteOffset, 4);
+    expect(sphere[3]).toBeCloseTo(3 * Math.sqrt(3), 5);
+    renderer.dispose();
+  });
+
   it('compaction 管线使用独立的 group=1 布局（与直接绘制管线区分）', () => {
     const { renderer } = makeRenderer();
     const direct = registerPipeline(renderer, { label: 'direct' });
@@ -543,6 +563,18 @@ describe('submitCulled 分组与 draw args', () => {
     expect(culled.bindGroupLayouts.length).toBe(2);
     expect(culled.bindGroupLayouts[1]).not.toBe(direct.bindGroupLayouts[1]);
 
+    renderer.dispose();
+  });
+
+  it('submitCulled 拒绝未声明 compaction 的管线', () => {
+    const { renderer } = makeRenderer();
+    const direct = registerPipeline(renderer, { label: 'direct' });
+    const geometry = cubeGeometry(renderer.geometryArena);
+
+    const vp = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    expect(() => renderer.submitCulled([{ geometry, pipeline: direct }], vp)).toThrow(
+      'compaction: true',
+    );
     renderer.dispose();
   });
 

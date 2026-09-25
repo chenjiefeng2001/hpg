@@ -40,6 +40,12 @@ export interface ExecutorStats {
   itemsDrawn: number;
 }
 
+export function assertRequiredBindGroup(item: RenderItem): void {
+  if (item.pipeline.bindGroupLayouts.length > 2 && !item.bindGroup) {
+    throw new Error(`Pipeline "${item.pipeline.label}" requires a bindGroup for group 2.`);
+  }
+}
+
 export class ExecutionBackend {
   /**
    * 传统 drawIndexed 路径（CPU 驱动）。
@@ -55,6 +61,7 @@ export class ExecutionBackend {
 
     for (const batch of batches) {
       const item = items[batch.geometryIndex] as RenderItem;
+      assertRequiredBindGroup(item);
       const geometry = item.geometry;
       const pipeline = batch.pipeline;
 
@@ -124,6 +131,7 @@ export class ExecutionBackend {
     for (let i = 0; i < batches.length; i++) {
       const batch = batches[i] as Batch;
       const item = items[batch.geometryIndex] as RenderItem;
+      assertRequiredBindGroup(item);
       const geometry = item.geometry;
       const pipeline = batch.pipeline;
 

@@ -195,6 +195,26 @@ describe('执行分组 — Direct（submit）', () => {
   });
 });
 
+describe('材质 bind group 输入契约', () => {
+  it('Direct 路径拒绝缺少 group=2 的 item', async () => {
+    const { renderer, store, direct, geoA } = await setup();
+    const renderItem = item(geoA, direct, undefined, 0);
+
+    expect(() => renderer.submit([renderItem])).toThrow('requires a bindGroup for group 2');
+    expect(() => renderer.submitDirect([renderItem])).toThrow('requires a bindGroup for group 2');
+    store.dispose();
+  });
+
+  it('GPU culling 路径拒绝缺少 group=2 的 item', async () => {
+    const { renderer, store, culled, geoA } = await setup();
+
+    expect(() => renderer.submitCulled([item(geoA, culled, undefined, 0)], IDENTITY_VP)).toThrow(
+      'requires a bindGroup for group 2',
+    );
+    store.dispose();
+  });
+});
+
 describe('执行分组 — GPU Culled（submitCulled）', () => {
   it('同 geometry + 同 pipeline + 不同 bindGroup ⇒ 独立 indirect draw + 各自 group=2', async () => {
     const { renderer, recorded, store, bgA, bgB, culled, geoA } = await setup();

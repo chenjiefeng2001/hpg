@@ -1,0 +1,58 @@
+name: Browser WebGPU Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to validate
+        required: true
+        default: main
+        type: string
+      filter:
+        description: Optional asset path filter
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-gate-${{ inputs.ref }}-${{ inputs.filter }}
+  cancel-in-progress: true
+
+jobs:
+  browser:
+    name: Chrome and WebGPU validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CHROME_PATH: /usr/bin/google-chrome
+      FILTER: ${{ inputs.filter }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify Chrome
+        shell: bash
+        run: |
+          if [ ! -x "$CHROME_PATH" ]; then
+            echo "Chrome is not available at $CHROME_PATH" >&2
+            exit 1
+          fi
+      - name: Run browser WebGPU gate
+        shell: bash
+        run: |
+          if [ -n "$FILTER" ]; then
+            npm run verify:browser -- "$FILTER"
+          else
+            npm run verify:browser
+          fi

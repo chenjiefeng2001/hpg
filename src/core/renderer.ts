@@ -12,7 +12,7 @@ import { PipelineCache } from './pipeline-cache';
 import { GeometryArena } from './geometry';
 import { RingBuffer, RING_ALIGN } from './ringbuffer';
 import { Batcher, instanceCountOf } from './batcher';
-import { ExecutionBackend } from './executor';
+import { ExecutionBackend, assertRequiredBindGroup } from './executor';
 import { instanceBufferOffset } from './commands';
 import type { Batch } from './commands';
 import { countingSortKeys, packKeyValue, DEFAULT_LAYER } from './keygen';
@@ -45,6 +45,48 @@ export interface RendererDescriptor extends RendererOptions {
 }
 
 const DEFAULT_CLEAR: [number, number, number, number] = [0.05, 0.06, 0.09, 1];
+
+function assertCompactionPipeline(item: RenderItem): void {
+  if (item.pipeline.desc.compaction !== true) {
+    throw new Error(`Pipeline "${item.pipeline.label}" must be registered with compaction: true for submitCulled().`);
+  }
+}
+
+function assertFiniteValues(values: ArrayLike<number>, name: string): void {
+  for (let i = 0; i < values.length; i++) {
+    if (!Number.isFinite(values[i])) throw new Error(`${name}[${i}] must be finite.`);
+  }
+}
+
+function validateRenderItem(item: RenderItem): void {
+  if (item.transforms && item.transforms.length % 16 !== 0) {
+    throw new Error('RenderItem.transforms length must be a multiple of 16.');
+  }
+  const count = instanceCountOf(item);
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new Error('RenderItem.instanceCount must be a non-negative safe integer.');
+  }
+  if (item.transforms) {
+    if (count > item.transforms.length / 16) {
+      throw new Error('RenderItem.instanceCount cannot exceed transforms.length / 16.');
+    }
+    assertFiniteValues(item.transforms, 'RenderItem.transforms');
+  }
+  if (item.instanceData) assertFiniteValues(item.instanceData, 'RenderItem.instanceData');
+  const topology = item.pipeline.desc.primitive?.topology ?? 'triangle-list';
+  if (item.geometry.primitive !== topology) {
+    throw new Error(`RenderItem geometry primitive ${item.geometry.primitive} does not match pipeline topology ${topology}.`);
+  }
+  if (item.depth !== undefined && !Number.isFinite(item.depth)) {
+    throw new Error('RenderItem.depth must be finite.');
+  }
+  if (item.bounding) {
+    assertFiniteValues([item.bounding.centerX, item.bounding.centerY, item.bounding.centerZ], 'RenderItem.bounding center');
+    if (!Number.isFinite(item.bounding.radius) || item.bounding.radius < 0) {
+      throw new Error('RenderItem.bounding.radius must be a non-negative finite number.');
+    }
+  }
+}
 
 export class Renderer {
   private cache = new PipelineCache();
@@ -234,6 +276,18 @@ export class Renderer {
    * 得到 `[global, instance, material]` —— 材质恰好落在 group 2（`RenderItem.bindGroup`）。
    */
   registerPipeline(desc: PipelineDesc): ResolvedPipeline {
+    if (desc.bindGroupLayouts.length === 0) {
+      throw new Error(`[hpg] 管线 "${desc.label ?? 'unnamed'}" 至少需要一个 group 0 layout。`);
+    }
+    if (desc.targets.length === 0) {
+      throw new Error(`[hpg] 管线 "${desc.label ?? 'unnamed'}" 至少需要一个 color target。`);
+    }
+    if (desc.targets.length !== 1) {
+      throw new Error(`[hpg] 管线 "${desc.label ?? 'unnamed'}" 当前只支持一个 color target。`);
+    }
+    if (desc.bindGroupLayouts.length > 2) {
+      throw new Error(`[hpg] 管线 "${desc.label ?? 'unnamed'}" 当前只支持 group 0 和一个额外 group 2。`);
+    }
     // 深度格式必须与渲染通道的深度附件一致，否则 draw 阶段才会报校验错误（很难定位）。
     if (desc.depth && desc.depth.format !== this.depthFormat) {
       throw new Error(
@@ -245,9 +299,14 @@ export class Renderer {
     // 且记录必须能装下「预留区 + mat4」。静默接受会让着色器读到错位的矩阵。
     const bpi = desc.bytesPerInstance ?? 80;
     const mmo = desc.modelMatrixOffset ?? 0;
-    if (mmo % 16 !== 0) {
+    if (!Number.isSafeInteger(mmo) || mmo < 0 || mmo % 16 !== 0) {
       throw new Error(
-        `[hpg] 管线 "${desc.label ?? 'unnamed'}" 的 modelMatrixOffset=${mmo} 必须是 16 的倍数（mat4x4<f32> 对齐）。`,
+        `[hpg] 管线 "${desc.label ?? 'unnamed'}" 的 modelMatrixOffset=${mmo} 必须是非负的 16 的倍数（mat4x4<f32> 对齐）。`,
+      );
+    }
+    if (!Number.isSafeInteger(bpi) || bpi < 64 || bpi % 4 !== 0) {
+      throw new Error(
+        `[hpg] 管线 "${desc.label ?? 'unnamed'}" 的 bytesPerInstance=${bpi} 必须是至少 64 且按 4 字节对齐的安全整数。`,
       );
     }
     if (bpi < mmo + 64) {
@@ -312,6 +371,11 @@ export class Renderer {
     };
 
     if (n === 0) return stats;
+
+    for (const item of items) {
+      validateRenderItem(item);
+      assertRequiredBindGroup(item);
+    }
 
     // 1. 排序键 + 计数排序（稳定）。
     const [near, far] = opts?.depthRange ?? [0, 1e4];
@@ -412,6 +476,11 @@ export class Renderer {
     };
 
     if (n === 0) return stats;
+
+    for (const item of items) {
+      validateRenderItem(item);
+      assertRequiredBindGroup(item);
+    }
 
     // 逐 item 组装到 instanceStore。
     // 每个 item 按**自己管线的实例跨步**落位（跨步 = 该管线 WGSL 中 InstanceData 的大小），
@@ -593,6 +662,17 @@ export class Renderer {
 
     if (n === 0) return stats;
 
+    if (vpMatrix.length < 16) {
+      throw new Error('vpMatrix must contain at least 16 values.');
+    }
+    assertFiniteValues(vpMatrix, 'vpMatrix');
+
+    for (const item of items) {
+      validateRenderItem(item);
+      assertRequiredBindGroup(item);
+      assertCompactionPipeline(item);
+    }
+
     // 1. 按 (geometry, pipeline, bindGroup) 分组。
     //    indirect draw 的 draw args 是逐 geometry 的，所以分组键必须含 geometry ——
     //    用 pipeline 分组会把共享同一管线的多个 mesh 当成一个，只画其中一个。
@@ -724,7 +804,17 @@ export class Renderer {
             spheresData[s] = r0 * lcX + r4 * lcY + r8 * lcZ + (m0[src + 12] as number);
             spheresData[s + 1] = r1 * lcX + r5 * lcY + r9 * lcZ + (m0[src + 13] as number);
             spheresData[s + 2] = r2 * lcX + r6 * lcY + r10 * lcZ + (m0[src + 14] as number);
-            const scale = Math.max(Math.hypot(r0, r1, r2), Math.hypot(r4, r5, r6), Math.hypot(r8, r9, r10));
+            const norm1 = Math.max(
+              Math.abs(r0) + Math.abs(r4) + Math.abs(r8),
+              Math.abs(r1) + Math.abs(r5) + Math.abs(r9),
+              Math.abs(r2) + Math.abs(r6) + Math.abs(r10),
+            );
+            const normInf = Math.max(
+              Math.abs(r0) + Math.abs(r1) + Math.abs(r2),
+              Math.abs(r4) + Math.abs(r5) + Math.abs(r6),
+              Math.abs(r8) + Math.abs(r9) + Math.abs(r10),
+            );
+            const scale = Math.sqrt(norm1 * normInf);
             spheresData[s + 3] = lr * scale;
             if (!local) {
               // 无几何包围盒信息：保守处理（永不被剔除），保证剔除失败不会造成漏画。
