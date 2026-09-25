@@ -107,8 +107,8 @@ interface BenchItem {
 function generateGrid(count: number, visibilityRatio: number): BenchItem[] {
   const items: BenchItem[] = [];
   const gridSize = Math.ceil(Math.sqrt(count));
-  const spacing = 2.0;
-  const halfGrid = (gridSize * spacing) / 2;
+  const spacing = Math.min(2.0, 56 / Math.max(1, gridSize - 1));
+  const halfGrid = (Math.max(0, gridSize - 1) * spacing) / 2;
 
   for (let i = 0; i < count; i++) {
     const row = Math.floor(i / gridSize);
@@ -140,10 +140,10 @@ function makeVP(): Float32Array {
   const out = new Float32Array(16);
   out[0] = 2 / (r - l);
   out[5] = 2 / (t - b);
-  out[10] = -1 / (f - n);
+  out[10] = -f / (f - n);
   out[12] = -(r + l) / (r - l);
   out[13] = -(t + b) / (t - b);
-  out[14] = -n / (f - n);
+  out[14] = -(f * n) / (f - n);
   out[15] = 1;
   return out;
 }
@@ -177,6 +177,7 @@ async function runCase(
   culledPipeline: ResolvedPipeline,
   vpMatrix: Float32Array,
   c: BenchCase,
+  timestampQueryAvailable: boolean,
 ): Promise<BenchResult> {
   // 每条路径的 group(1) 布局不同：culled 用 compaction 管线，其余用普通实例管线。
   const activePipeline = c.path === 'gpu-cull' ? culledPipeline : pipeline;
@@ -197,29 +198,35 @@ async function runCase(
   const cpuTimes: number[] = [];
   const gpuTimes: number[] = [];
   let lastStats;
-  const useTimestamps = c.path === 'direct' || c.path === 'gpu-cull';
+  const useTimestamps = timestampQueryAvailable && (c.path === 'direct' || c.path === 'gpu-cull');
 
   for (let i = 0; i < SAMPLES; i++) {
-    const tq = useTimestamps ? new TimestampQuery(renderer.device, 2) : null;
-    const t0 = performance.now();
+    let tq: TimestampQuery | null = null;
     try {
-      lastStats = c.path === 'gpu-cull'
-        ? renderer.submitCulled(items, vpMatrix, tq ?? undefined)
-        : c.path === 'direct'
-          ? renderer.submitDirect(items, tq ?? undefined)
-          : renderer.submit(items);
-    } catch (e: any) {
-      console.error(`[hpg:bench] FAIL case=${c.name} count=${c.count} vis=${c.visibilityRatio} path=${c.path}`, e);
-      throw e;
-    }
-    const t1 = performance.now();
-    cpuTimes.push(t1 - t0);
+      if (useTimestamps) {
+        tq = new TimestampQuery(renderer.device, 2);
+      }
+      const t0 = performance.now();
+      try {
+        lastStats = c.path === 'gpu-cull'
+          ? renderer.submitCulled(items, vpMatrix, tq ?? undefined)
+          : c.path === 'direct'
+            ? renderer.submitDirect(items, tq ?? undefined)
+            : renderer.submit(items);
+      } catch (e: any) {
+        console.error(`[hpg:bench] FAIL case=${c.name} count=${c.count} vis=${c.visibilityRatio} path=${c.path}`, e);
+        throw e;
+      }
+      const t1 = performance.now();
+      cpuTimes.push(t1 - t0);
 
-    if (tq) {
-      const timestamps = await tq.readback(renderer.device);
-      const gpuNs = timestamps[1]! - timestamps[0]!;
-      gpuTimes.push(gpuNs / 1e6); // ns → ms
-      tq.destroy();
+      if (tq) {
+        const timestamps = await tq.readback(renderer.device);
+        const gpuNs = timestamps[1]! - timestamps[0]!;
+        gpuTimes.push(gpuNs / 1e6); // ns → ms
+      }
+    } finally {
+      tq?.destroy();
     }
   }
 
@@ -259,8 +266,8 @@ function formatEnv(device: GPUDevice): string {
 function formatTable(results: BenchResult[]): string {
   const lines: string[] = [];
 
-  lines.push('Case    │ Objects │ Visible │ Path         │ CPU ms (median) │ GPU ms (median) │ CPU p95  │ GPU p95  │ Draws │ Candidates│ Batches');
-  lines.push('────────┼─────────┼─────────┼──────────────┼─────────────────┼─────────────────┼──────────┼──────────┼───────┼───────────┼────────');
+  lines.push('Case    │ Objects │ Visible │ Path         │ CPU ms (median) │ GPU render ms │ CPU p95  │ GPU render p95 │ Draws │ Candidates│ Batches');
+  lines.push('────────┼─────────┼─────────┼──────────────┼───────────────┼───────────────┼─────────────────┼───────┼───────────┼────────');
 
   for (const r of results) {
     lines.push([
@@ -302,15 +309,15 @@ function formatBreakEven(results: BenchResult[]): string {
     lines.push(`${count} candidates:`);
 
     if (direct) {
-      const gpu = direct.gpuMs ? ` + GPU ${direct.gpuMs.median.toFixed(3)}` : '';
-      lines.push(`  Direct       : CPU ${direct.cpuMs.median.toFixed(3)}${gpu} ms (p95 ${direct.cpuMs.p95.toFixed(3)})`);
+       const gpu = direct.gpuMs ? ` + render ${direct.gpuMs.median.toFixed(3)}` : '';
+       lines.push(`  Direct       : CPU ${direct.cpuMs.median.toFixed(3)}${gpu} ms (p95 ${direct.cpuMs.p95.toFixed(3)})`);
     }
     if (batcher) {
       lines.push(`  Batcher      : CPU ${batcher.cpuMs.median.toFixed(3)} ms (p95 ${batcher.cpuMs.p95.toFixed(3)})`);
     }
     if (gpuCull) {
-      const gpu = gpuCull.gpuMs ? ` + GPU ${gpuCull.gpuMs.median.toFixed(3)}` : '';
-      lines.push(`  GPU Culling  : CPU ${gpuCull.cpuMs.median.toFixed(3)}${gpu} ms (p95 ${gpuCull.cpuMs.p95.toFixed(3)})`);
+       const gpu = gpuCull.gpuMs ? ` + render ${gpuCull.gpuMs.median.toFixed(3)}` : '';
+       lines.push(`  GPU Culling  : CPU ${gpuCull.cpuMs.median.toFixed(3)}${gpu} ms (p95 ${gpuCull.cpuMs.p95.toFixed(3)})`);
     }
 
     if (direct && gpuCull) {
@@ -323,7 +330,7 @@ function formatBreakEven(results: BenchResult[]): string {
     }
     if (direct?.gpuMs && gpuCull?.gpuMs) {
       const gpuRatio = gpuCull.gpuMs.median / direct.gpuMs.median;
-      lines.push(`  → GPU Culling GPU time ${gpuRatio < 1 ? '<' : '>'} Direct (${gpuRatio.toFixed(2)}x)`);
+       lines.push(`  → GPU Culling render-pass time ${gpuRatio < 1 ? '<' : '>'} Direct (${gpuRatio.toFixed(2)}x)`);
     }
     lines.push('');
   }
@@ -387,7 +394,10 @@ async function main() {
     return;
   }
 
-  const device = await adapter.requestDevice();
+  const timestampQueryAvailable = adapter.features.has('timestamp-query');
+  const device = await adapter.requestDevice({
+    requiredFeatures: timestampQueryAvailable ? ['timestamp-query'] : [],
+  });
   const canvas = document.getElementById('canvas') as HTMLCanvasElement;
   const context = canvas.getContext('webgpu')!;
   const format = navigator.gpu.getPreferredCanvasFormat();
@@ -470,7 +480,13 @@ async function main() {
     const key = `${count}-${vis}`;
     if (!sceneCache.has(key)) {
       const scene = generateGrid(count, vis);
-      const transforms = scene.map(() => identity());
+      const transforms = scene.map(({ x, y, z }) => {
+        const transform = identity();
+        transform[12] = x;
+        transform[13] = y;
+        transform[14] = z;
+        return transform;
+      });
       sceneCache.set(key, { scene, transforms });
     }
     return sceneCache.get(key)!;
@@ -487,7 +503,7 @@ async function main() {
     await new Promise((r) => setTimeout(r, 0)); // yield to browser.
 
     const { scene, transforms } = getScene(c.count, c.visibilityRatio);
-    const result = await runCase(renderer, scene, transforms, geometry, pipeline, culledPipeline, vpMatrix, c);
+    const result = await runCase(renderer, scene, transforms, geometry, pipeline, culledPipeline, vpMatrix, c, timestampQueryAvailable);
     results.push(result);
   }
 
@@ -526,7 +542,7 @@ async function main() {
     '═'.repeat(100),
     '',
     '  - CPU ms = time from performance.now() around submit() call.',
-    '  - GPU ms = GPU execution time via timestamp query (writeTimestamp → resolve → readback).',
+     '  - GPU render ms = render-pass time via timestamp query (timestampWrites → resolve → readback; culling compute excluded).',
     '  - "Direct" = renderer.submitDirect() — per-item draw calls, no batching.',
     '  - "Batcher" = renderer.submit() — automatic batching, instanced draw.',
     '  - "GPU Culling" = renderer.submitCulled() — compute frustum culling + indirect draw.',

@@ -13,7 +13,7 @@
  * 用法:
  *   npm run verify:browser                 # 全部语料 × direct,culled
  *   npm run verify:browser -- medium       # 路径子串过滤
- *   node benchmark/browser-material-check.mjs --modes=direct --limit=3
+ *   node benchmark/browser-material-check.mjs --modes=direct --limit=3 --smoke
  */
 
 import { spawn } from 'node:child_process';
@@ -28,6 +28,14 @@ const VITE_PORT = 5199;
 const BASE = `http://127.0.0.1:${VITE_PORT}`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const childProcesses = new Set();
+const terminateChild = (child) => {
+  childProcesses.delete(child);
+  child.kill();
+};
+process.on('exit', () => {
+  for (const child of childProcesses) child.kill();
+});
 
 // ─── CLI ────────────────────────────────────────────────────
 
@@ -36,9 +44,13 @@ const flag = (name, dflt) => {
   const hit = argv.find((a) => a.startsWith(`--${name}=`));
   return hit ? hit.slice(name.length + 3) : dflt;
 };
-const FILTER = argv.find((a) => !a.startsWith('--')) ?? '';
+const FILTER = flag('filter', argv.find((a) => !a.startsWith('--')) ?? '');
 const MODES = flag('modes', 'direct,culled').split(',').map((s) => s.trim()).filter(Boolean);
+if (MODES.length === 0 || MODES.some((mode) => mode !== 'direct' && mode !== 'culled')) throw new Error(`Unsupported mode in --modes: ${MODES.join(',')}`);
+const SMOKE = argv.includes('--smoke');
+if (!SMOKE && (!MODES.includes('direct') || !MODES.includes('culled'))) throw new Error('Full gate requires both direct and culled modes; use --smoke for a single-mode smoke test.');
 const LIMIT = Number(flag('limit', '0')) || 0;
+const PARTIAL_RUN = FILTER !== '' || LIMIT > 0;
 
 // ─── Chrome 定位 ────────────────────────────────────────────
 
@@ -78,10 +90,14 @@ async function startVite() {
     cwd: ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  childProcesses.add(child);
   child.stderr.on('data', () => {});
   const deadline = Date.now() + 60000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error(`vite 退出（code ${child.exitCode}）`);
+    if (child.exitCode !== null) {
+      childProcesses.delete(child);
+      throw new Error(`vite 退出（code ${child.exitCode}）`);
+    }
     try {
       const res = await fetch(BASE, { signal: AbortSignal.timeout(2000) });
       if (res.ok) return child;
@@ -90,7 +106,7 @@ async function startVite() {
     }
     await sleep(400);
   }
-  child.kill();
+  terminateChild(child);
   throw new Error(`vite dev server 未在 60s 内就绪（${BASE}）`);
 }
 
@@ -157,18 +173,32 @@ async function launchChrome(exe) {
     ],
     { stdio: ['ignore', 'ignore', 'pipe'] },
   );
+  childProcesses.add(child);
+  let launchError;
+  child.once('error', (error) => { launchError = error; });
 
-  const portFile = join(userDataDir, 'DevToolsActivePort');
-  const deadline = Date.now() + 30000;
-  while (Date.now() < deadline) {
-    if (existsSync(portFile)) {
-      const port = Number(readFileSync(portFile, 'utf8').split('\n')[0]);
-      if (port > 0) return { child, userDataDir, port };
+  try {
+    const portFile = join(userDataDir, 'DevToolsActivePort');
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      if (launchError) throw launchError;
+      if (child.exitCode !== null) throw new Error(`Chrome 退出（code ${child.exitCode}）`);
+      if (existsSync(portFile)) {
+        const port = Number(readFileSync(portFile, 'utf8').split('\n')[0]);
+        if (port > 0) return { child, userDataDir, port };
+      }
+      await sleep(200);
     }
-    await sleep(200);
+    throw new Error('Chrome DevTools 端口未就绪');
+  } catch (error) {
+    terminateChild(child);
+    try {
+      rmSync(userDataDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+    throw error;
   }
-  child.kill();
-  throw new Error('Chrome DevTools 端口未就绪');
 }
 
 async function connect(port) {
@@ -179,6 +209,31 @@ async function connect(port) {
     ws.addEventListener('error', () => rej(new Error('WebSocket 连接失败')), { once: true });
   });
   return new Cdp(ws);
+}
+
+async function assertWebGpuAdapter(cdp) {
+  const { targetId } = await cdp.send('Target.createTarget', { url: `${BASE}/demo/glb-viewer.html?probe=1` });
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+  try {
+    await cdp.send('Runtime.enable', {}, sessionId);
+    await cdp.send('Page.enable', {}, sessionId);
+    await cdp.send('Page.bringToFront', {}, sessionId).catch(() => {});
+    const deadline = Date.now() + 10000;
+    let value;
+    while (Date.now() < deadline) {
+      const result = await cdp.send('Runtime.evaluate', {
+        expression: '(async () => ({ gpu: !!navigator.gpu, adapter: !!(navigator.gpu && await navigator.gpu.requestAdapter()) }))()',
+        awaitPromise: true,
+        returnByValue: true,
+      }, sessionId);
+      value = result?.result?.value;
+      if (value?.gpu && value?.adapter) return;
+      await sleep(250);
+    }
+    throw new Error(`Chrome 没有可用的 WebGPU adapter（gpu=${value?.gpu}, adapter=${value?.adapter}）；请使用具备 WebGPU 能力的 runner。`);
+  } finally {
+    cdp.send('Target.closeTarget', { targetId }).catch(() => {});
+  }
 }
 
 /** 打开一个页面，轮询 window.__hpgResult 直到出现或超时。 */
@@ -206,7 +261,7 @@ async function runPage(cdp, url, timeoutMs = 30000) {
          stats: (document.getElementById('stats')||{}).textContent || '',
          errors: (document.getElementById('errors')||{}).textContent || '',
          title: document.title || '',
-         hasCanvas: !!document.querySelector('canvas'),
+          hasCanvas: !!document.querySelector('canvas'),
        })`,
     );
     return { result: null, diag: diag ? JSON.parse(diag) : null };
@@ -233,25 +288,29 @@ async function main() {
     .slice(0, LIMIT > 0 ? LIMIT : undefined);
 
   if (assets.length === 0) {
-    console.log('没有匹配的 .glb。');
-    return;
+    throw new Error('没有匹配的 .glb。');
+  }
+  if (!FILTER && LIMIT === 0 && assets.length !== 23) {
+    throw new Error(`完整语料 gate 期望 23 个 .glb，实际发现 ${assets.length} 个。`);
   }
 
   console.log(`hpg — Real Chrome material validation (Phase 15E)`);
   console.log(`chrome : ${chromeExe}`);
-  console.log(`assets : ${assets.length} (${MODES.join(' / ')})`);
+  console.log(`assets : ${assets.length} (${MODES.join(' / ')}${PARTIAL_RUN ? ' / partial' : ''})`);
   console.log('');
 
   const vite = await startVite();
-  const chrome = await launchChrome(chromeExe);
+  let chrome;
   let cdp;
   const failures = [];
   const rows = [];
 
   try {
-    cdp = await connect(chrome.port);
+     chrome = await launchChrome(chromeExe);
+     cdp = await connect(chrome.port);
+     await assertWebGpuAdapter(cdp);
 
-    for (const abs of assets) {
+     for (const abs of assets) {
       const rel = relative(MODEL_ROOT, abs).split(sep).join('/');
       const urlPath = `/benchmark/assets/models/${rel}`;
       const perMode = {};
@@ -270,6 +329,13 @@ async function main() {
           failures.push(`${rel} [${mode}]: 30s 内没有结果 — diag=${JSON.stringify(run?.diag)}`);
           continue;
         }
+        if (result.mode !== mode) failures.push(`${rel} [${mode}]: page reported mode ${result.mode}`);
+        if (!Number.isFinite(result.items) || result.items <= 0) failures.push(`${rel} [${mode}]: no render items`);
+        if (!Number.isFinite(result.drawCalls) || result.drawCalls <= 0) failures.push(`${rel} [${mode}]: no draw calls`);
+        if (!Number.isFinite(result.instances) || result.instances <= 0) failures.push(`${rel} [${mode}]: no instances`);
+        if (!result.pixels || !Number.isFinite(result.pixels.totalPixels) || result.pixels.totalPixels <= 0 || !Number.isFinite(result.pixels.foregroundPixels) || result.pixels.foregroundPixels <= 0) {
+          failures.push(`${rel} [${mode}]: empty pixel signature — ${JSON.stringify(result.pixels)}`);
+        }
         perMode[mode] = result;
 
         const err = result.validationErrors ?? [];
@@ -280,12 +346,16 @@ async function main() {
       const direct = perMode.direct;
       const culled = perMode.culled;
       let parity = '—';
-      if (direct?.pixels && culled?.pixels) {
-        const dMax = gridDelta(direct.pixels, culled.pixels);
-        const litDelta = Math.abs(direct.pixels.litPixels - culled.pixels.litPixels);
-        parity = `gridΔ${dMax} litΔ${litDelta}`;
-        if (!(dMax <= 12 && litDelta <= Math.max(40, direct.pixels.litPixels * 0.02))) {
-          failures.push(`${rel}: Direct/Culled 像素不一致（${parity}）`);
+      if (MODES.includes('direct') && MODES.includes('culled')) {
+        if (!direct?.pixels || !culled?.pixels) {
+          failures.push(`${rel}: Direct/Culled 缺少像素签名`);
+        } else {
+          const dMax = gridDelta(direct.pixels, culled.pixels);
+          const litDelta = Math.abs(direct.pixels.litPixels - culled.pixels.litPixels);
+          parity = `gridΔ${dMax} litΔ${litDelta}`;
+          if (!(dMax <= 12 && litDelta <= Math.max(40, direct.pixels.litPixels * 0.02))) {
+            failures.push(`${rel}: Direct/Culled 亮度网格不一致（${parity}）`);
+          }
         }
       }
 
@@ -305,13 +375,15 @@ async function main() {
     }
   } finally {
     cdp?.close();
-    chrome.child.kill();
-    vite.kill();
+    if (chrome) terminateChild(chrome.child);
+    terminateChild(vite);
     await sleep(300);
-    try {
-      rmSync(chrome.userDataDir, { recursive: true, force: true });
-    } catch {
-      /* ignore */
+    if (chrome) {
+      try {
+        rmSync(chrome.userDataDir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -326,7 +398,9 @@ async function main() {
 
   console.log('');
   if (failures.length === 0) {
-    console.log(`✅ ${rows.length} 个模型：无 validation error、无贴图跳过、Direct/Culled 一致`);
+    const parityText = MODES.includes('direct') && MODES.includes('culled') ? '、Direct/Culled 亮度网格近似一致' : '';
+    const scopeText = PARTIAL_RUN ? (SMOKE ? '（smoke，部分语料）' : '（部分语料）') : SMOKE ? '（smoke）' : '';
+    console.log(`通过 ${rows.length} 个模型：无 validation error、无贴图跳过${parityText}${scopeText}`);
   } else {
     console.log(`❌ ${failures.length} 个问题：`);
     for (const f of failures) console.log(`  - ${f}`);
@@ -336,9 +410,9 @@ async function main() {
 
 // 全局看门狗：任何环节卡死都要能退出（否则后台子进程会挂住整个进程）。
 const watchdog = setTimeout(() => {
-  console.error('✖ 超时（5 分钟）—— 强制退出');
+  console.error('✖ 超时（45 分钟）—— 强制退出');
   process.exit(1);
-}, 5 * 60 * 1000);
+}, 45 * 60 * 1000);
 watchdog.unref?.();
 
 main()

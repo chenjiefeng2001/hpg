@@ -188,11 +188,13 @@ async function main() {
       const m = transforms[i]!;
       const angle = t + i * 0.01;
       const rot = rotationY(new Float32Array(16), angle);
-      m[12] = cfg.x;
-      m[13] = cfg.y;
-      m[14] = cfg.z;
-      m[15] = 1;
-      multiply(m, rot, m);
+      const translate = new Float32Array([
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        cfg.x, cfg.y, cfg.z, 1,
+      ]);
+      multiply(m, translate, rot);
     }
 
     // 构建 RenderItem[]（按模式选择对应管线的 group(1) 布局）。

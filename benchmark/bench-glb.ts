@@ -10,7 +10,7 @@
  *   - GLB parse time
  *   - Asset import time (GeometryArena upload)
  *   - CPU submit time (Direct / Batcher / GPU Culling)
- *   - GPU execution time (via TimestampQuery)
+ *   - GPU render-pass time (via TimestampQuery; culling compute excluded)
  */
 
 import { Renderer, uniformBindGroupLayout } from '../src/core/renderer';
@@ -385,6 +385,7 @@ async function benchModel(
   makeCulledPipeline: () => ResolvedPipeline,
   vpMatrix: Float32Array,
   samples: number,
+  timestampQueryAvailable: boolean,
 ): Promise<BenchResult> {
   // 1. Generate GLB
   const tGen0 = performance.now();
@@ -398,104 +399,113 @@ async function benchModel(
 
   // 3. Import (GeometryArena upload)
   const tImport0 = performance.now();
-  const scene = importGltfAsset(asset, renderer, { scale: 1, flipV: true });
-  const tImport1 = performance.now();
+  const scene = importGltfAsset(asset, renderer, { scale: 1, flipV: false });
 
-  // 4. Generate RenderItems。submitCulled 按 geometry 分组，无需逐 mesh 单独管线；
-  //    但 group(1) 布局不同 —— culled 路径必须用 compaction 管线（几何体共享）。
-  const renderItems = sceneToRenderItems(scene, makePipeline());
-  const culledItems = sceneToRenderItems(scene, makeCulledPipeline());
-
-  // Count stats
-  let vertexCount = 0;
-  let indexCount = 0;
-  for (const m of scene.meshes) {
-    vertexCount += m.geometry.vertexCount;
-    indexCount += m.geometry.indexCount;
-  }
-
-  // 5. Benchmark submit paths — try timestamps, skip if unsupported
-  let hasTimestampQuery = false;
   try {
-    const tq = new TimestampQuery(renderer.device, 2);
-    tq.destroy();
-    hasTimestampQuery = true;
-  } catch {
-    hasTimestampQuery = false;
-  }
-  const statusSuffix = hasTimestampQuery ? '' : ' (GPU timing unavailable)';
+    const tImport1 = performance.now();
+    // 4. Generate RenderItems。submitCulled 按 geometry 分组，无需逐 mesh 单独管线；
+    //    但 group(1) 布局不同 —— culled 路径必须用 compaction 管线（几何体共享）。
+    const renderItems = sceneToRenderItems(scene, makePipeline());
+    const culledItems = sceneToRenderItems(scene, makeCulledPipeline());
 
-  // Warmup
-  for (let w = 0; w < 5; w++) {
-    renderer.submit(renderItems);
-  }
-  // GPU sync
-  await renderer.device.queue.onSubmittedWorkDone();
-
-  // Direct
-  const directCpuTimes: number[] = [];
-  const directGpuTimes: number[] = [];
-  for (let i = 0; i < samples; i++) {
-    const tq = hasTimestampQuery ? new TimestampQuery(renderer.device, 2) : null;
-    const t0 = performance.now();
-    // Direct = 逐 item 独立 draw call（submit() 的第二个参数现在是 SubmitOptions，不是时间戳查询）。
-    renderer.submitDirect(renderItems, tq ?? undefined);
-    const t1 = performance.now();
-    directCpuTimes.push(t1 - t0);
-    if (tq) {
-      const ts = await tq.readback(renderer.device);
-      directGpuTimes.push((ts[1]! - ts[0]!) / 1e6);
-      tq.destroy();
+    // Count stats
+    let vertexCount = 0;
+    let indexCount = 0;
+    for (const m of scene.meshes) {
+      vertexCount += m.geometry.vertexCount;
+      indexCount += m.geometry.indexCount;
     }
-  }
 
-  // GPU Culling
-  const culledCpuTimes: number[] = [];
-  const culledGpuTimes: number[] = [];
-  for (let i = 0; i < samples; i++) {
-    const tq = hasTimestampQuery ? new TimestampQuery(renderer.device, 2) : null;
-    const t0 = performance.now();
-    renderer.submitCulled(culledItems, vpMatrix, tq ?? undefined);
-    const t1 = performance.now();
-    culledCpuTimes.push(t1 - t0);
-    if (tq) {
-      const ts = await tq.readback(renderer.device);
-      culledGpuTimes.push((ts[1]! - ts[0]!) / 1e6);
-      tq.destroy();
+    // 5. Benchmark submit paths — try timestamps, skip if unsupported
+     const hasTimestampQuery = timestampQueryAvailable;
+
+    // Warmup
+    for (let w = 0; w < 5; w++) {
+      renderer.submit(renderItems);
     }
+    // GPU sync
+    await renderer.device.queue.onSubmittedWorkDone();
+
+    // Direct
+    const directCpuTimes: number[] = [];
+    const directGpuTimes: number[] = [];
+    for (let i = 0; i < samples; i++) {
+      let tq: TimestampQuery | null = null;
+      try {
+        if (hasTimestampQuery) {
+          tq = new TimestampQuery(renderer.device, 2);
+        }
+        const t0 = performance.now();
+        // Direct = 逐 item 独立 draw call（submit() 的第二个参数现在是 SubmitOptions，不是时间戳查询）。
+        renderer.submitDirect(renderItems, tq ?? undefined);
+        const t1 = performance.now();
+        directCpuTimes.push(t1 - t0);
+        if (tq) {
+          const ts = await tq.readback(renderer.device);
+          directGpuTimes.push((ts[1]! - ts[0]!) / 1e6);
+        }
+      } finally {
+        tq?.destroy();
+      }
+    }
+
+    // GPU Culling
+    const culledCpuTimes: number[] = [];
+    const culledGpuTimes: number[] = [];
+    for (let i = 0; i < samples; i++) {
+      let tq: TimestampQuery | null = null;
+      try {
+        if (hasTimestampQuery) {
+          tq = new TimestampQuery(renderer.device, 2);
+        }
+        const t0 = performance.now();
+        renderer.submitCulled(culledItems, vpMatrix, tq ?? undefined);
+        const t1 = performance.now();
+        culledCpuTimes.push(t1 - t0);
+        if (tq) {
+          const ts = await tq.readback(renderer.device);
+          culledGpuTimes.push((ts[1]! - ts[0]!) / 1e6);
+        }
+      } finally {
+        tq?.destroy();
+      }
+    }
+
+     // Stats
+     const directStats = renderer.submitDirect(renderItems);
+     const culledStats = renderer.submitCulled(culledItems, vpMatrix);
+
+    function median(arr: number[]): number {
+      const s = [...arr].sort((a, b) => a - b);
+      return s[Math.floor(s.length / 2)] ?? 0;
+    }
+
+    return {
+      model: config.name,
+      glbSize: glb.byteLength,
+      parseMs: tParse1 - tParse0,
+      importMs: tImport1 - tImport0,
+      meshCount: scene.meshes.length,
+      vertexCount,
+      indexCount,
+      materialCount: scene.materials.length,
+      renderItemcount: renderItems.length,
+       direct: {
+         cpuMs: median(directCpuTimes),
+         gpuMs: median(directGpuTimes),
+         draws: directStats.drawCalls,
+         batches: directStats.batches,
+      },
+       culled: {
+         cpuMs: median(culledCpuTimes),
+         gpuMs: median(culledGpuTimes),
+         draws: culledStats.drawCalls,
+         batches: culledStats.batches,
+      },
+    };
+  } finally {
+    scene.dispose();
   }
-
-  // Stats
-  const stats = renderer.submit(renderItems);
-
-  function median(arr: number[]): number {
-    const s = [...arr].sort((a, b) => a - b);
-    return s[Math.floor(s.length / 2)] ?? 0;
-  }
-
-  return {
-    model: config.name,
-    glbSize: glb.byteLength,
-    parseMs: tParse1 - tParse0,
-    importMs: tImport1 - tImport0,
-    meshCount: scene.meshes.length,
-    vertexCount,
-    indexCount,
-    materialCount: scene.materials.length,
-    renderItemcount: renderItems.length,
-    direct: {
-      cpuMs: median(directCpuTimes),
-      gpuMs: median(directGpuTimes),
-      draws: stats.drawCalls,
-      batches: stats.batches,
-    },
-    culled: {
-      cpuMs: median(culledCpuTimes),
-      gpuMs: median(culledGpuTimes),
-      draws: stats.drawCalls,
-      batches: stats.batches,
-    },
-  };
 }
 
 // ─── Report ─────────────────────────────────────────────────
@@ -541,9 +551,9 @@ function renderReport(results: BenchResult[]): string {
   lines.push('</table>');
   lines.push('</div>');
 
-  // GPU execution time
+  // GPU render-pass execution time; GPU-culling compute is intentionally excluded.
   lines.push('<div class="section">');
-  lines.push('<h2>GPU Execution Time (median)</h2>');
+  lines.push('<h2>GPU Render-Pass Time (median; culling compute excluded)</h2>');
   lines.push('<table>');
   lines.push('<tr><th>Model</th><th class="num">Direct</th><th class="num">GPU Culled</th><th class="num">Ratio</th><th class="num">Draw Calls</th></tr>');
   for (const r of results) {
@@ -592,11 +602,11 @@ function renderReport(results: BenchResult[]): string {
   }
   lines.push('</div>');
 
-  // Bottleneck analysis
+  // Render-pass delta only; the culling compute pass is not included in the timestamp interval.
   lines.push('<div class="section">');
   lines.push('<h2>Bottleneck Analysis</h2>');
   lines.push('<table>');
-  lines.push('<tr><th>Model</th><th>Dominant Phase</th><th>GPU Culling Benefit</th><th>Recommendation</th></tr>');
+  lines.push('<tr><th>Model</th><th>Dominant Phase</th><th>Render-pass Delta</th><th>Recommendation</th></tr>');
   for (const r of results) {
     const phases = [
       { name: 'Parse', time: r.parseMs },
@@ -643,7 +653,10 @@ async function runBenchmarkInternal() {
     statusEl.textContent = 'No GPU adapter.';
     return;
   }
-  const device = await adapter.requestDevice();
+  const timestampQueryAvailable = adapter.features.has('timestamp-query');
+  const device = await adapter.requestDevice({
+    requiredFeatures: timestampQueryAvailable ? ['timestamp-query'] : [],
+  });
   const canvas = document.createElement('canvas');
   const context = canvas.getContext('webgpu')!;
   const format = navigator.gpu.getPreferredCanvasFormat();
@@ -692,9 +705,10 @@ async function runBenchmarkInternal() {
     return renderer.registerPipeline({
       label: 'bench-pipeline-culled',
       vsCode: VS_BENCH_CULLED,
-      fsCode: FS_BENCH,
-      compaction: true,
-      ...commonDesc,
+       fsCode: FS_BENCH,
+       compaction: true,
+       compactionContract: 'hpg-compaction-v1',
+       ...commonDesc,
     });
   }
 
@@ -726,7 +740,7 @@ async function runBenchmarkInternal() {
     statusEl.textContent = `Running: ${config.name}...`;
     await new Promise((r) => setTimeout(r, 0));
 
-    const result = await benchModel(config, renderer, makePipeline, makeCulledPipeline, vpMatrix, SAMPLES);
+    const result = await benchModel(config, renderer, makePipeline, makeCulledPipeline, vpMatrix, SAMPLES, timestampQueryAvailable);
     results.push(result);
   }
 

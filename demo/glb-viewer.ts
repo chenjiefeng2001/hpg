@@ -11,11 +11,11 @@
 
 import { Renderer, uniformBindGroupLayout } from '../src/core/renderer';
 import { parseGltf } from '../src/core/gltf';
-import { importGltfAsset, sceneToRenderItems } from '../src/core/asset-importer';
+import { importGltfAsset, sceneToRenderItems, type ImportedScene } from '../src/core/asset-importer';
 import { createBrowserImageDecoder, createMaterialBindGroupLayout, MaterialStore } from '../src/core/texture';
 import { MATERIAL_LAYOUT_TEMPLATE } from '../src/shaders/instance';
 import { identity, multiply, perspective, lookAt } from '../src/core/math';
-import type { GlobalBinding, RenderItem, ResolvedPipeline } from '../src/types';
+import type { GlobalBinding, RenderItem, RenderStats, ResolvedPipeline } from '../src/types';
 
 // ─── Shaders ────────────────────────────────────────────────
 
@@ -470,6 +470,8 @@ async function main() {
   // 而 loadGlbData() 会在后面的语句执行之前就被 await 调用。
   let harnessTick = 0;
   let harnessDone = false;
+  let harnessCapturing = false;
+  let harnessValidation: Promise<void> | null = null;
   let harnessInfo: Record<string, unknown> | null = null;
 
   /**
@@ -510,7 +512,7 @@ async function main() {
   };
   const context = canvas.getContext('webgpu')!;
   const format = navigator.gpu.getPreferredCanvasFormat();
-  context.configure({ device, format, alphaMode: 'premultiplied' });
+  context.configure({ device, format, alphaMode: 'premultiplied', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
 
   // Renderer
   const renderer = Renderer.create({ device, context, format });
@@ -561,9 +563,10 @@ async function main() {
   const pipelineCulled = renderer.registerPipeline({
     label: 'glb-pipeline-culled',
     vsCode: VS_GLB_CULLED,
-    fsCode: FS_GLB,
-    compaction: true,
-    ...commonPipelineDesc,
+     fsCode: FS_GLB,
+     compaction: true,
+     compactionContract: 'hpg-compaction-v1',
+     ...commonPipelineDesc,
   });
 
   // baseColorTexture 解码（浏览器适配器）。
@@ -571,7 +574,9 @@ async function main() {
 
   // Load GLB
   let useCulled = params.get('mode') === 'culled';
+  let loadGeneration = 0;
   let materialStore: MaterialStore | null = null;
+  let importedScene: ImportedScene | null = null;
   let renderItems: RenderItem[] = [];
   /** 与 renderItems 相同的几何/实例，但使用 compaction 管线（submitCulled 专用）。 */
   let culledItems: RenderItem[] = [];
@@ -585,7 +590,15 @@ async function main() {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
-  async function loadGlbData(data: ArrayBuffer, fileName?: string) {
+  async function loadGlbData(data: ArrayBuffer, fileName?: string, requestedGeneration?: number) {
+    const generation = requestedGeneration ?? ++loadGeneration;
+    if (generation !== loadGeneration) return;
+    harnessInfo = null;
+    harnessDone = false;
+    harnessTick = 0;
+    harnessErrors.length = 0;
+    delete (window as unknown as Record<string, unknown>).__hpgResult;
+    document.getElementById('harness-result')?.remove();
     const t0 = performance.now();
 
     // Parse
@@ -593,28 +606,48 @@ async function main() {
     const asset = parseGltf(data);
     const tParse1 = performance.now();
 
-    // 未实现 feature 的可见提示（贴图 / alphaMode / 蒙皮 / 扩展 …）
-    showNotices(asset.warnings);
-
     // Import (GPU upload)
     const tImport0 = performance.now();
-    const scene = importGltfAsset(asset, renderer, { scale: 1, flipV: true });
+    const scene = importGltfAsset(asset, renderer, { scale: 1, flipV: false });
     const tImport1 = performance.now();
+    let nextMaterialStore: MaterialStore | null = null;
+    let committed = false;
 
-    // 材质贴图（baseColorTexture → GPUTexture + sampler + group=2 bind group）
-    materialStore?.dispose();
-    materialStore = await MaterialStore.create(device, asset, imageDecoder, { label: 'glb-viewer' });
+    try {
+      // 材质贴图（baseColorTexture → GPUTexture + sampler + group=2 bind group）
+      const createdStore = await MaterialStore.create(device, asset, imageDecoder, { label: 'glb-viewer' });
+      nextMaterialStore = createdStore;
+      if (generation !== loadGeneration) return;
 
-    // Scene → RenderItems（Direct 与 Culled 各一份，几何体共享；附上材质 bind group）
-    renderItems = sceneToRenderItems(scene, pipeline, materialStore);
-    culledItems = sceneToRenderItems(scene, pipelineCulled, materialStore);
+      // Scene → RenderItems（Direct 与 Culled 各一份，几何体共享；附上材质 bind group）
+      const nextRenderItems = sceneToRenderItems(scene, pipeline, createdStore);
+      const nextCulledItems = sceneToRenderItems(scene, pipelineCulled, createdStore);
+      const previousScene = importedScene;
+      const previousStore = materialStore;
+
+      importedScene = scene;
+      materialStore = createdStore;
+      renderItems = nextRenderItems;
+      culledItems = nextCulledItems;
+      nextMaterialStore = null;
+      committed = true;
+      previousScene?.dispose();
+      previousStore?.dispose();
+    } finally {
+      if (!committed) {
+        nextMaterialStore?.dispose();
+        scene.dispose();
+      }
+    }
+
+    showNotices(asset.warnings);
     const t1 = performance.now();
 
     // 贴图统计（未解码 / 失败时给出可读原因）
-    if (materialStore.stats.textures > 0 || materialStore.stats.skipped.length > 0) {
+    if (materialStore!.stats.textures > 0 || materialStore!.stats.skipped.length > 0) {
       console.log(
-        `Materials: ${materialStore.stats.materials}, textures uploaded: ${materialStore.stats.textures}`,
-        materialStore.stats.skipped.length > 0 ? materialStore.stats.skipped : '',
+        `Materials: ${materialStore!.stats.materials}, textures uploaded: ${materialStore!.stats.textures}`,
+        materialStore!.stats.skipped.length > 0 ? materialStore!.stats.skipped : '',
       );
     }
 
@@ -633,10 +666,10 @@ async function main() {
     }
 
     // Count materials used
-    const materialSet = new Set<number>();
-    for (const ri of renderItems) {
-      materialSet.add(ri.pipeline ? 1 : 0);
-    }
+     const materialSet = new Set<number>();
+     for (const mesh of scene.meshes) {
+       if (mesh.materialIndex != null) materialSet.add(mesh.materialIndex);
+     }
 
     // Console logging for benchmark
     const parseMs = (tParse1 - tParse0).toFixed(1);
@@ -811,51 +844,99 @@ async function main() {
 
   // File input
   btnFile.addEventListener('click', () => fileInput.click());
-  fileInput.addEventListener('change', async () => {
-    const file = fileInput.files?.[0];
-    if (!file) return;
-    const buf = await file.arrayBuffer();
-    await loadGlbData(buf, file.name);
-  });
+   fileInput.addEventListener('change', async () => {
+     const file = fileInput.files?.[0];
+     if (!file) return;
+     const generation = ++loadGeneration;
+     const buf = await file.arrayBuffer();
+     await loadGlbData(buf, file.name, generation);
+   });
 
   // ── Harness：渲染稳定后采集一次结果 ────────────────────────
-  /** 把 WebGPU canvas 拷到 2D canvas 后统计亮度（真实像素验证）。 */
-  function capturePixels(): Record<string, unknown> | null {
-    const probe = document.createElement('canvas');
-    probe.width = canvas.width;
-    probe.height = canvas.height;
-    const ctx = probe.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return null;
-    ctx.drawImage(canvas, 0, 0);
-    const d = ctx.getImageData(0, 0, probe.width, probe.height).data;
-    const total = d.length / 4;
-    let lit = 0;
-    let sum = 0;
-    const G = 8;
-    const grid = new Array<number>(G * G).fill(0);
-    const cnt = new Array<number>(G * G).fill(0);
-    for (let y = 0; y < probe.height; y++) {
-      const gy = Math.min(G - 1, Math.floor((y * G) / probe.height));
-      for (let x = 0; x < probe.width; x++) {
-        const i = (y * probe.width + x) * 4;
-        const l = 0.2126 * (d[i] as number) + 0.7152 * (d[i + 1] as number) + 0.0722 * (d[i + 2] as number);
-        sum += l;
-        if (l > 8) lit++;
-        const gx = Math.min(G - 1, Math.floor((x * G) / probe.width));
-        grid[gy * G + gx] += l;
-        cnt[gy * G + gx]++;
+  type PixelReadback = { buffer: GPUBuffer; width: number; height: number; bytesPerRow: number };
+
+  function beginPixelCapture(texture: GPUTexture): PixelReadback | null {
+    if (!format.endsWith('8unorm') && !format.endsWith('8unorm-srgb')) return null;
+    const width = texture.width;
+    const height = texture.height;
+    if (width === 0 || height === 0) return null;
+    const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+    const buffer = device.createBuffer({
+      label: 'glb-viewer:pixel-readback',
+      size: bytesPerRow * height,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const encoder = device.createCommandEncoder({ label: 'glb-viewer:pixel-readback' });
+    encoder.copyTextureToBuffer(
+      { texture },
+      { buffer, bytesPerRow, rowsPerImage: height },
+      { width, height },
+    );
+    device.queue.submit([encoder.finish()]);
+    return { buffer, width, height, bytesPerRow };
+  }
+
+  async function capturePixels(readback: PixelReadback): Promise<Record<string, unknown> | null> {
+    try {
+      await device.queue.onSubmittedWorkDone();
+      await readback.buffer.mapAsync(GPUMapMode.READ);
+      try {
+        const data = new Uint8Array(readback.buffer.getMappedRange());
+        const total = readback.width * readback.height;
+        let lit = 0;
+        let foreground = 0;
+        let alphaPixels = 0;
+        let sum = 0;
+        const background = [13, 15, 23];
+        const G = 8;
+        const grid = new Array<number>(G * G).fill(0);
+        const cnt = new Array<number>(G * G).fill(0);
+        const bgra = format.startsWith('bgra');
+        for (let y = 0; y < readback.height; y++) {
+          const gy = Math.min(G - 1, Math.floor((y * G) / readback.height));
+          for (let x = 0; x < readback.width; x++) {
+            const i = y * readback.bytesPerRow + x * 4;
+            const alpha = (data[i + 3] as number) / 255;
+            const r = (bgra ? data[i + 2] : data[i]) as number;
+            const g = data[i + 1] as number;
+            const b = (bgra ? data[i] : data[i + 2]) as number;
+            const cr = r * alpha + (background[0] as number) * (1 - alpha);
+            const cg = g * alpha + (background[1] as number) * (1 - alpha);
+            const cb = b * alpha + (background[2] as number) * (1 - alpha);
+            const l = 0.2126 * cr + 0.7152 * cg + 0.0722 * cb;
+            const distance = Math.hypot(cr - (background[0] as number), cg - (background[1] as number), cb - (background[2] as number));
+            sum += l;
+            if (alpha > 0.01) alphaPixels++;
+            if (alpha > 0.01 && l > 8) lit++;
+            if (alpha > 0.01 && distance > 8) foreground++;
+            const gx = Math.min(G - 1, Math.floor((x * G) / readback.width));
+            grid[gy * G + gx] += l;
+            cnt[gy * G + gx]++;
+          }
+        }
+        return {
+          litPixels: lit,
+          foregroundPixels: foreground,
+          alphaPixels,
+          totalPixels: total,
+          avgLuma: Number((sum / Math.max(1, total)).toFixed(2)),
+          grid: grid.map((s, i) => Number((s / Math.max(1, cnt[i] as number)).toFixed(1))),
+        };
+      } finally {
+        readback.buffer.unmap();
       }
+    } finally {
+      readback.buffer.destroy();
     }
-    return {
-      litPixels: lit,
-      totalPixels: total,
-      avgLuma: Number((sum / Math.max(1, total)).toFixed(2)),
-      grid: grid.map((s, i) => Number((s / Math.max(1, cnt[i] as number)).toFixed(1))),
-    };
   }
 
   // Render loop
   function frame() {
+    if (harnessCapturing) {
+      requestAnimationFrame(frame);
+      return;
+    }
+
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
     if (canvas.width !== w || canvas.height !== h) {
@@ -868,41 +949,68 @@ async function main() {
 
     // Update uniform
     device.queue.writeBuffer(uniformBuffer, 0, vpMatrix);
+    const captureThisFrame = harnessOn && harnessInfo && !harnessDone && !harnessCapturing && ++harnessTick >= 4;
 
     // Submit（用 validation error scope 抓取逐帧校验错误）
     device.pushErrorScope('validation');
     const t0 = performance.now();
+    let frameStats: RenderStats | null = null;
     if (culledItems.length > 0) {
       if (useCulled) {
         // 注意：必须用 compaction 管线注册的 items。
-        renderer.submitCulled(culledItems, vpMatrix);
+        frameStats = renderer.submitCulled(culledItems, vpMatrix);
       } else {
         // 传入相机位置 → 未指定 depth 的物体按距离近→远排序（early-z 友好）。
-        renderer.submit(renderItems, { camera: camera.getEye(), depthRange: [camera.near, camera.far] });
+        frameStats = renderer.submit(renderItems, { camera: camera.getEye(), depthRange: [camera.near, camera.far] });
       }
     }
     const t1 = performance.now();
-    void device.popErrorScope().then((err) => {
+    const frameReadback = captureThisFrame ? beginPixelCapture(context.getCurrentTexture()) : null;
+    const validation = device.popErrorScope().then((err) => {
       if (err) showError(err.message, 'validation');
     });
+    if (harnessOn) {
+      harnessValidation = validation
+        .then(() => device.queue.onSubmittedWorkDone())
+        .then(() => undefined)
+        .catch((error) => { showError(String(error), 'harness'); });
+    }
 
     const cpuMs = document.getElementById('cpu-ms');
     if (cpuMs) cpuMs.textContent = `${(t1 - t0).toFixed(2)} ms`;
 
     // Harness：等几帧让贴图/绑定稳定，再采集一次结果。
-    if (harnessOn && harnessInfo && !harnessDone && ++harnessTick >= 4) {
-      harnessDone = true;
-      const result = {
+    if (captureThisFrame && harnessValidation && frameReadback) {
+      harnessCapturing = true;
+      const captureGeneration = loadGeneration;
+      const captureValidation = harnessValidation;
+      const captureReadback = frameReadback;
+      const pendingResult = {
         ...harnessInfo,
         mode: useCulled ? 'culled' : 'direct',
-        validationErrors: harnessErrors,
-        pixels: capturePixels(),
+        drawCalls: frameStats?.drawCalls ?? 0,
+        instances: frameStats?.instances ?? 0,
       };
-      (window as unknown as Record<string, unknown>).__hpgResult = result;
-      const pre = document.createElement('pre');
-      pre.id = 'harness-result';
-      pre.textContent = JSON.stringify(result);
-      document.body.appendChild(pre);
+      void captureValidation
+        .then(async () => {
+          if (harnessDone || captureGeneration !== loadGeneration) {
+            captureReadback.buffer.destroy();
+            return;
+          }
+          const pixels = await capturePixels(captureReadback);
+          if (harnessDone || captureGeneration !== loadGeneration) return;
+          const result = { ...pendingResult, pixels, validationErrors: [...harnessErrors] };
+          (window as unknown as Record<string, unknown>).__hpgResult = result;
+          const pre = document.createElement('pre');
+          pre.id = 'harness-result';
+          pre.textContent = JSON.stringify(result);
+          document.body.appendChild(pre);
+          harnessDone = true;
+        })
+        .catch((error) => { showError(String(error), 'harness'); })
+        .finally(() => {
+          harnessCapturing = false;
+        });
     }
 
     requestAnimationFrame(frame);
