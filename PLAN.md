@@ -834,7 +834,7 @@ instrumentation capability，不作为功能开发前置条件。
 | 全量回归 | `npm test` | 19 files / 230 passed（冻结时历史记录；当前 hardening 为 282） |
 | 真实资产审计 | `npm run audit` | parse ok 23/23、BROKEN（静默错误数据）= 0 |
 | 真实 Chrome + WebGPU | `npm run verify:browser` | 23/23：validation error = 0、贴图跳过 = 0、Direct/Culled 亮度网格近似一致 |
-| GPU culling 矩阵 | `npm run verify:culling-matrix` | 0% / 10% / 50% / 100%：drawArgs、mapping、范围/重复校验通过 |
+| GPU culling 矩阵 | `npm run verify:culling-matrix` | 0% / 10% / 50% / 100%：多 geometry/material 的 drawArgs、mapping、范围/重复校验通过 |
 | 库构建 | `npm run build` | `dist/lib/index.js`、`.d.ts` 与 sourcemap 产出；大小是一次工具链快照 |
 | Demo 构建 | `npm run build:demo` | 多页面入口全部产出（index / phase5 / glb-viewer / benchmark / glb-bench） |
 

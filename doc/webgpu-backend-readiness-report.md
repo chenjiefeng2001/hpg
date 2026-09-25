@@ -406,7 +406,7 @@ workflow：
 23/23 GLB audit: parse ok, BROKEN = 0
 Chrome 23/23: validation error = 0, texture skipped = 0,
 Direct/Culled brightness-grid parity = 0
-GPU culling matrix: 0% / 10% / 50% / 100%, mapping valid = true
+GPU culling matrix: 0% / 10% / 50% / 100%, multi-geometry/material mapping valid = true
 ```
 
 仍不能由本轮静态/本地证据关闭的事项：

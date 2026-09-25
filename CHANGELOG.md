@@ -10,7 +10,7 @@
 - 增加 WebGPU adapter 快速预检、GLB reload generation、Geometry ownership/context device/shader layout 校验，并为 doubleSided 未实现语义发出 warning。
 - TimestampQuery 改用标准 WebGPU `timestampWrites` pass descriptor；geometry free-list 保留对齐 padding，未使用的 sparse accessor 不再阻断解析。
 - Node 回归：19 个文件、282 个测试；Chrome 23/23 模型通过，0 validation error，Direct/Culled 亮度网格近似一致。
-- 新增 GPU culling correctness matrix：0%/10%/50%/100% 可见率，校验 indirect drawArgs 与 compaction mapping。
+- 新增 GPU culling correctness matrix：0%/10%/50%/100% 可见率，覆盖多 geometry/material，校验 indirect drawArgs 与 compaction mapping。
 
 ## 0.2.0 — 技术基线冻结（Baseline Freeze）
 

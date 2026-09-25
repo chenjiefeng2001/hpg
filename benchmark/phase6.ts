@@ -20,8 +20,10 @@ import { Renderer, uniformBindGroupLayout } from '../src/core/renderer';
 import { VS_INSTANCED, VS_INSTANCED_COMPACTION, FS_COLOR } from '../src/shaders/instance';
 import { extractFrustumPlanes, sphereInFrustum } from '../src/core/culling';
 import { TimestampQuery } from '../src/core/timestamp';
+import { MaterialStore, type ImageDecoder } from '../src/core/texture';
 import { identity } from '../src/core/math';
 import type { GlobalBinding, RenderItem, BoundingSphere, ResolvedPipeline } from '../src/types';
+import type { GltfAsset } from '../src/core/gltf';
 
 // ─── Types ───────────────────────────────────────────────────
 
@@ -382,8 +384,8 @@ interface CullingMatrixResult {
   ratio: number;
   expectedVisible: number;
   actualVisible: number;
-  expectedByGeometry: number[];
-  actualByGeometry: number[];
+  expectedByGroup: number[];
+  actualByGroup: number[];
   mappingValid: boolean;
   outOfRange: number[];
   duplicates: number[];
@@ -393,13 +395,14 @@ interface CullingMatrixResult {
 async function runCullingMatrix(
   renderer: Renderer,
   pipeline: ResolvedPipeline,
+  materialGroups: [GPUBindGroup, GPUBindGroup],
   geometryA: ReturnType<Renderer['createGeometry']>,
   geometryB: ReturnType<Renderer['createGeometry']>,
   vpMatrix: Float32Array,
 ): Promise<CullingMatrixResult[]> {
   const planes = extractFrustumPlanes(vpMatrix);
   const count = 1000;
-  const split = count / 2;
+  const quarter = count / 4;
   const results: CullingMatrixResult[] = [];
 
   for (const ratio of [0, 0.1, 0.5, 1]) {
@@ -409,9 +412,11 @@ async function runCullingMatrix(
       transform[12] = entry.x;
       transform[13] = entry.y;
       transform[14] = entry.z;
+      const group = Math.min(3, Math.floor(index / quarter));
       return {
-        geometry: index < split ? geometryA : geometryB,
+        geometry: group < 2 ? geometryA : geometryB,
         pipeline,
+        bindGroup: materialGroups[group & 1]!,
         transforms: transform,
         instanceData: entry.color,
         bounding: entry.bounding,
@@ -419,27 +424,27 @@ async function runCullingMatrix(
     });
     renderer.submitCulled(items, vpMatrix);
     const debug = await renderer.readCullingDebug(renderer.device);
-    const expectedByGeometry = [0, 0];
+    const expectedByGroup = [0, 0, 0, 0];
     for (let i = 0; i < scene.length; i++) {
       if (sphereInFrustum(planes, scene[i]!.bounding.centerX, scene[i]!.bounding.centerY, scene[i]!.bounding.centerZ, scene[i]!.bounding.radius)) {
-        expectedByGeometry[i < split ? 0 : 1]++;
+        expectedByGroup[Math.min(3, Math.floor(i / quarter))]!++;
       }
     }
-    const actualByGeometry = Array.from(debug.visibleInstances);
-    const expectedVisible = expectedByGeometry.reduce((a, b) => a + b, 0);
-    const actualVisible = actualByGeometry.reduce((a, b) => a + b, 0);
+    const actualByGroup = Array.from(debug.visibleInstances);
+    const expectedVisible = expectedByGroup.reduce((a, b) => a + b, 0);
+    const actualVisible = actualByGroup.reduce((a, b) => a + b, 0);
     const outOfRange = Array.from(debug.outOfRangeIndices);
     const duplicates = Array.from(debug.duplicateIndices);
     results.push({
       ratio,
       expectedVisible,
       actualVisible,
-      expectedByGeometry,
-      actualByGeometry,
+      expectedByGroup,
+      actualByGroup,
       mappingValid: debug.mappingValid,
       outOfRange,
       duplicates,
-      ok: debug.mappingValid && actualVisible === expectedVisible && actualByGeometry.every((value, i) => value === expectedByGeometry[i]) && outOfRange.length === 0 && duplicates.length === 0,
+      ok: debug.mappingValid && actualVisible === expectedVisible && actualByGroup.length === expectedByGroup.length && actualByGroup.every((value, i) => value === expectedByGroup[i]) && outOfRange.length === 0 && duplicates.length === 0,
     });
   }
   return results;
@@ -501,6 +506,35 @@ async function main() {
     targets: [{ format }],
   };
 
+  const materialAsset: GltfAsset = {
+    meshes: [],
+    materials: [
+      { name: 'matrix-a', baseColorFactor: [1, 0, 0, 1], metallicFactor: 0, roughnessFactor: 1, doubleSided: false, alphaMode: 'OPAQUE', alphaCutoff: 0.5 },
+      { name: 'matrix-b', baseColorFactor: [0, 1, 0, 1], metallicFactor: 0, roughnessFactor: 1, doubleSided: false, alphaMode: 'OPAQUE', alphaCutoff: 0.5 },
+    ],
+    images: [],
+    nodes: [],
+    rootNodes: [],
+    warnings: [],
+  };
+  const materialStore = await MaterialStore.create(
+    device,
+    materialAsset,
+    { decode: async () => { throw new Error('matrix assets do not contain textures'); } } as unknown as ImageDecoder,
+    { srgb: false, label: 'phase6-matrix' },
+  );
+  const materialCulledPipeline = renderer.registerPipeline({
+    label: 'bench-quad-culled-material',
+    vsCode: VS_INSTANCED_COMPACTION,
+    fsCode: FS_COLOR,
+    vertexLayouts,
+    bindGroupLayouts: [layout, materialStore.layout],
+    globalBindings,
+    depth: commonDesc.depth,
+    targets: [{ format }],
+    compaction: true,
+  });
+
   // Direct / Batcher 路径：group(1) = 单实例绑定（VS_INSTANCED 读 instances[instanceIdx]）。
   const pipeline = renderer.registerPipeline({
     label: 'bench-quad',
@@ -554,10 +588,12 @@ async function main() {
   const vpMatrix = makeVP();
   if (new URLSearchParams(location.search).has('matrix')) {
     output.textContent = 'Running GPU culling correctness matrix…';
-    const results = await runCullingMatrix(renderer, culledPipeline, geometry, geometryB, vpMatrix);
+     const materialGroups: [GPUBindGroup, GPUBindGroup] = [materialStore.bindGroupFor(0)!, materialStore.bindGroupFor(1)!];
+    const results = await runCullingMatrix(renderer, materialCulledPipeline, materialGroups, geometry, geometryB, vpMatrix);
     const matrix = { results, ok: results.every((result) => result.ok) };
     (window as unknown as Record<string, unknown>).__hpgCullingMatrix = matrix;
     output.textContent = JSON.stringify(matrix, null, 2);
+    materialStore.dispose();
     renderer.dispose();
     return;
   }
